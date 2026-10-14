@@ -1,0 +1,462 @@
+import json
+import os
+import threading
+from datetime import datetime, timedelta, timezone
+
+from . import integrations
+from .db import add_lead, connect, event, now, save_lead, set_setting, setting, uid, unpack
+from .delivery import generate_delivery, quality_check
+from .documents import create_document
+from .policy import Blocked, live_enabled, outreach_policy, rate_for
+from .research import research, score_lead
+
+LOCK = threading.RLock()
+STAGES = [
+    {"id": 1, "name": "Lead Finder", "short": "Discover", "description": "Source businesses and score the opportunity using explicit evidence.", "icon": "radar"},
+    {"id": 2, "name": "Researcher", "short": "Research", "description": "Inspect the website, platform, catalog, performance and competitors. Produce a one-page brief.", "icon": "search"},
+    {"id": 3, "name": "Outreach", "short": "Reach out", "description": "Enroll evidence-based messages through a warmed secondary domain. Pause on elevated bounces.", "icon": "send"},
+    {"id": 4, "name": "Sales", "short": "Qualify", "description": "Handle replies within the rate card, coordinate calls and prepare proposals for approval.", "icon": "chat"},
+    {"id": 5, "name": "CRM", "short": "Remember", "description": "Consolidate the handoff. Every agent also writes to this audit trail throughout the journey.", "icon": "database"},
+    {"id": 6, "name": "Client Success", "short": "Welcome", "description": "Send a welcome PDF on booking and a project plan after call notes arrive.", "icon": "spark"},
+    {"id": 7, "name": "Delivery", "short": "Create", "description": "Route to Shopify, WooCommerce, WordPress, React, React Native or the content specialist.", "icon": "code"},
+    {"id": 8, "name": "Quality", "short": "Refine", "description": "Check artifacts, surface major issues and require final human release approval.", "icon": "shield"},
+    {"id": 9, "name": "Finance", "short": "Invoice", "description": "Draft Stripe invoices. Creating and sending an invoice requires explicit approval of the exact amount.", "icon": "wallet"},
+    {"id": 10, "name": "Reporting", "short": "Update", "description": "Send weekly progress updates while work is active and record the project close.", "icon": "chart"},
+    {"id": 11, "name": "Referral", "short": "Grow", "description": "Thirty days after close, send a personal referral request with a unique tracking link.", "icon": "gift"},
+]
+
+
+def queue(db, lead, kind, payload, unique=None):
+    key = unique or f"{lead['id']}:{kind}"
+    row = db.execute("SELECT * FROM outbox WHERE id=?", (key,)).fetchone()
+    if row:
+        return dict(row)
+    db.execute("INSERT INTO outbox(id,lead_id,kind,payload,created_at) VALUES(?,?,?,?,?)", (key, lead["id"], kind, json.dumps(payload), now()))
+    event(db, lead["id"], "CRM", "action.queued", kind)
+    return {"id": key, "status": "pending"}
+
+
+def approval(db, lead, kind, title, payload):
+    row = db.execute("SELECT * FROM approvals WHERE lead_id=? AND kind=?", (lead["id"], kind)).fetchone()
+    if row:
+        return unpack(row)
+    approval_id = uid("ap_")
+    db.execute("INSERT INTO approvals(id,lead_id,kind,title,payload,created_at) VALUES(?,?,?,?,?,?)", (approval_id, lead["id"], kind, title, json.dumps(payload), now()))
+    event(db, lead["id"], STAGES[lead["stage"] - 1]["name"], "approval.requested", title)
+    return {"id": approval_id, "status": "pending", "payload": payload}
+
+
+def send_status(db, lead, kind):
+    row = db.execute("SELECT status FROM outbox WHERE id=?", (f"{lead['id']}:{kind}",)).fetchone()
+    return row[0] if row else None
+
+
+def welcome(db, lead):
+    if lead["details"].get("welcome_document"):
+        return
+    doc = create_document(db, lead, "welcome")
+    lead["details"]["welcome_document"] = doc["id"]
+    queue(db, lead, "welcome", {"subject": f"{lead['name']} × ZanDop — your next chapter", "body": f"Thanks for booking a conversation with ZanDop. We have put together a welcome guide for your {lead['service']} project, tailored to {lead['industry'] or 'your business'}. It includes what to expect and what to bring. See you on the call!", "attachment": doc["path"]})
+    event(db, lead["id"], "Client Success", "welcome.triggered", "Booking received; personalized PDF queued immediately")
+
+
+def advance(lead_id):
+    with LOCK, connect() as db:
+        lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+        if not lead:
+            raise KeyError(lead_id)
+        if lead["status"] in {"closed", "rejected", "suppressed"}:
+            return lead
+        d, stage = lead["details"], lead["stage"]
+        agent = STAGES[stage - 1]["name"]
+        before = (lead["stage"], lead["status"], d.get("blocker"))
+        try:
+            d.pop("blocker", None)
+            if stage == 1:
+                d["score_components"] = score_lead(lead)
+                lead["score"] = d["score_components"]["total"]
+                lead["stage"], lead["status"] = 2, "ready"
+                event(db, lead_id, agent, "lead.scored", json.dumps(d["score_components"]))
+            elif stage == 2:
+                d["research"] = research(lead)
+                create_document(db, lead, "brief")
+                lead["stage"], lead["status"] = 3, "ready"
+                event(db, lead_id, agent, "research.completed", "Evidence, limitations and brief saved")
+            elif stage == 3:
+                if d.get("call_booked"):
+                    lead["stage"], lead["status"] = 4, "awaiting_call"
+                else:
+                    flaw = d.get("research", {}).get("flaw")
+                    if not flaw:
+                        raise Blocked("No concrete flaw was substantiated; further research is needed before outreach.")
+                    if not lead["demo"]:
+                        outreach_policy(db, lead)
+                    message = {"subject": f"A small idea for {lead['name']}", "body": f"Hi {lead['name']} team,\n\n{flaw}\n\nWe help {lead['industry'] or 'business'} teams improve their {lead['service']} experience. Worth a quick conversation about a focused fix?\n\nZanDop\nIf this is not relevant, reply 'no thanks' and we will not follow up."}
+                    row = queue(db, lead, "cold_email", message)
+                    if row["status"] in {"done", "simulated"}:
+                        lead["stage"], lead["status"] = 4, "awaiting_reply"
+                    else:
+                        lead["status"] = "queued"
+            elif stage == 4:
+                if not d.get("call_booked"):
+                    lead["status"] = "awaiting_reply"
+                elif not d.get("call_notes"):
+                    lead["status"] = "awaiting_call"
+                else:
+                    rate = rate_for(lead["service"], bool(lead["demo"]))
+                    proposal = approval(db, lead, "proposal", f"Review proposal for {lead['name']}", {"amount": rate["amount"], "currency": rate["currency"], "scope": rate["scope"],
+                        "subject": f"{lead['name']} — proposed scope", "body": f"Based on our conversation: {rate['scope']}. Proposed fee: {rate['amount']/100:,.2f} {rate['currency'].upper()}. This is a proposal for discussion, not a signed contract. No legal agreement has been executed."})
+                    if proposal["status"] == "rejected":
+                        lead["status"] = "rejected"
+                    elif proposal["status"] == "executed":
+                        lead["stage"], lead["status"] = 5, "ready"
+                    else:
+                        lead["status"] = "approval"
+            elif stage == 5:
+                event(db, lead_id, "CRM", "handoff.completed", "Contact, research, messages, call notes, proposal and document versions consolidated")
+                lead["stage"], lead["status"] = 6, "ready"
+            elif stage == 6:
+                if not d.get("call_notes"):
+                    raise Blocked("Call notes or a transcript and the chosen service are required for the project plan.")
+                if not d.get("plan_document"):
+                    doc = create_document(db, lead, "plan")
+                    d["plan_document"] = doc["id"]
+                    queue(db, lead, "plan", {"subject": f"{lead['name']} — your project blueprint", "body": "Here is your working project plan, shaped by our conversation. It outlines the delivery direction and next steps; it is not a legal agreement or payment request.", "attachment": doc["path"]})
+                if send_status(db, lead, "plan") in {"done", "simulated"}:
+                    lead["stage"], lead["status"] = 7, "ready"
+                else:
+                    lead["status"] = "queued"
+            elif stage == 7:
+                if not d.get("delivery"):
+                    d["delivery"] = generate_delivery(db, lead)
+                lead["stage"], lead["status"] = 8, "ready"
+            elif stage == 8:
+                if not d.get("quality"):
+                    d["quality"] = quality_check(lead)
+                    event(db, lead_id, agent, "quality.checked", json.dumps(d["quality"]))
+                gate = approval(db, lead, "final_delivery", f"Approve final delivery for {lead['name']}", {"checks": d["quality"], "files": d["delivery"]["files"], "subject": f"{lead['name']} — your approved deliverables", "body": "Your ZanDop deliverables are attached, following final human review. The handoff notes describe setup and any remaining production requirements.", "attachment": d["delivery"]["path"]})
+                if gate["status"] == "executed":
+                    lead["stage"], lead["status"] = 9, "ready"
+                else:
+                    lead["status"] = "rejected" if gate["status"] == "rejected" else "approval"
+            elif stage == 9:
+                rate = rate_for(lead["service"], bool(lead["demo"]))
+                gate = approval(db, lead, "invoice", f"Approve invoice for {lead['name']}", {"amount": rate["amount"], "currency": rate["currency"], "description": rate["scope"], "recipient": lead["email"], "action": "Create, finalize and email a Stripe invoice. No automatic charge."})
+                if d.get("paid_at") and gate["status"] == "executed":
+                    lead["stage"], lead["status"] = 10, "ready"
+                else:
+                    lead["status"] = "awaiting_payment" if gate["status"] == "executed" else "rejected" if gate["status"] == "rejected" else "approval"
+            elif stage == 10:
+                d["closed_at"] = now()
+                d["referral_token"] = uid("ref_")
+                lead["stage"], lead["status"] = 11, "scheduled"
+                event(db, lead_id, agent, "project.closed", "Final delivery approved and invoice payment confirmed; referral scheduled in 30 days")
+            elif stage == 11:
+                due = datetime.fromisoformat(d["closed_at"]) + timedelta(days=30)
+                if datetime.now(timezone.utc) >= due:
+                    base = "https://example.com" if lead["demo"] else integrations.required("PUBLIC_BASE_URL").rstrip("/")
+                    link = base + "/r/" + d["referral_token"]
+                    row = queue(db, lead, "referral", {"subject": f"A month on, {lead['name']} — know someone we could help?", "body": f"It was a pleasure working on your {lead['service']} project. If someone in your network is planning a similar next step, we would love an introduction. Your personal referral link: {link}\n\nThanks for being part of ZanDop."})
+                    if row["status"] in {"done", "simulated"}:
+                        lead["status"] = "closed"
+                else:
+                    lead["status"] = "scheduled"
+        except Blocked as exc:
+            lead["status"] = "blocked"
+            d["blocker"] = str(exc)
+        except Exception as exc:
+            lead["status"] = "blocked"
+            d["blocker"] = f"{type(exc).__name__}: agent operation failed. Inspect configuration and retry."
+        after = (lead["stage"], lead["status"], d.get("blocker"))
+        if before != after:
+            event(db, lead_id, agent, "stage.updated", f"Stage {lead['stage']} / {lead['status']}" + (f" / {d['blocker']}" if d.get("blocker") else ""))
+        save_lead(db, lead)
+        return lead
+
+
+def decide(approval_id, decision, actor):
+    with LOCK, connect() as db:
+        gate = unpack(db.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone())
+        if not gate:
+            raise KeyError(approval_id)
+        if gate["status"] != "pending":
+            raise Blocked("This decision has already been recorded.")
+        if decision not in {"approve", "reject"}:
+            raise Blocked("Invalid approval decision.")
+        if decision == "approve" and gate["kind"] not in {"proposal", "final_delivery", "invoice"}:
+            raise Blocked("This escalation has no automatically executable action.")
+        lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (gate["lead_id"],)).fetchone())
+        if decision == "approve" and gate["kind"] == "final_delivery" and any(item["status"] == "failed" for item in gate["payload"].get("checks", [])):
+            raise Blocked("Failed quality checks must be resolved before final delivery approval.")
+        status = "approved" if decision == "approve" else "rejected"
+        db.execute("UPDATE approvals SET status=?,decided_at=?,decided_by=? WHERE id=?", (status, now(), actor, approval_id))
+        event(db, lead["id"], "Human", f"approval.{status}", f"{gate['title']} / actor={actor}")
+        if status == "approved":
+            queue(db, lead, gate["kind"], {**gate["payload"], "approval_id": approval_id})
+        else:
+            lead["status"] = "rejected"
+            save_lead(db, lead)
+        return {"status": status}
+
+
+def drain_outbox():
+    with LOCK:
+        with connect() as db:
+            rows = [unpack(row) for row in db.execute("SELECT * FROM outbox WHERE status='pending' ORDER BY created_at LIMIT 50")]
+        for row in rows:
+            with connect() as db:
+                lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (row["lead_id"],)).fetchone())
+                if db.execute("SELECT 1 FROM suppressions WHERE email=?", (lead["email"],)).fetchone() and row["kind"] in {"cold_email", "sales_reply", "referral"}:
+                    db.execute("UPDATE outbox SET status='blocked',result=? WHERE id=?", ("Recipient suppressed", row["id"]))
+                    event(db, lead["id"], "Outreach", "send.blocked", "Recipient suppressed")
+                    continue
+                if row["kind"] in {"invoice", "proposal", "final_delivery"}:
+                    gate = db.execute("SELECT status,payload FROM approvals WHERE id=? AND lead_id=? AND kind=?", (row["payload"].get("approval_id"), lead["id"], row["kind"])).fetchone()
+                    original = {k: v for k, v in row["payload"].items() if k != "approval_id"}
+                    if not gate or gate["status"] != "approved" or original != json.loads(gate["payload"]):
+                        db.execute("UPDATE outbox SET status='blocked',result=? WHERE id=?", ("Missing approval or payload mismatch", row["id"]))
+                        event(db, lead["id"], "Policy", "send.blocked", "Missing exact-payload approval")
+                        continue
+                try:
+                    if not lead["demo"]:
+                        integrations.require_live()
+                        if row["kind"] in {"cold_email", "sales_reply"}:
+                            outreach_policy(db, lead)
+                except Blocked as exc:
+                    # This is a known preflight failure, so no provider request was attempted.
+                    db.execute("UPDATE outbox SET result=? WHERE id=?", (str(exc), row["id"]))
+                    continue
+                claimed = db.execute("UPDATE outbox SET status='sending',attempts=attempts+1 WHERE id=? AND status='pending'", (row["id"],)).rowcount
+                if not claimed:
+                    continue
+            try:
+                if lead["demo"]:
+                    result, status = {"demo": True, "id": uid("demo_")}, "simulated"
+                else:
+                    action = row["kind"]
+                    result = integrations.send_cold(lead, row["payload"], row["id"]) if action == "cold_email" else integrations.send_reply(lead, row["payload"], row["id"]) if action == "sales_reply" else integrations.issue_invoice(lead, row["payload"], row["id"]) if action == "invoice" else integrations.book_call(lead, row["payload"], row["id"]) if action == "booking" else integrations.send_transactional(lead, row["payload"], row["id"])
+                    status = "done"
+                with connect() as db:
+                    db.execute("UPDATE outbox SET status=?,result=? WHERE id=?", (status, json.dumps(result), row["id"]))
+                    if row["payload"].get("approval_id"):
+                        db.execute("UPDATE approvals SET status='executed',result=? WHERE id=?", (json.dumps(result), row["payload"]["approval_id"]))
+                    if row["kind"] == "invoice":
+                        lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead["id"],)).fetchone())
+                        lead["details"]["invoice"] = {**result, "amount": row["payload"]["amount"], "currency": row["payload"]["currency"]}
+                        save_lead(db, lead)
+                    if row["kind"] != "booking":
+                        db.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?)", (uid("msg_"), lead["id"], "outbound", row["payload"].get("subject", "Invoice"), row["payload"].get("body", row["payload"].get("description", "")), status, str(result.get("id", "")), now()))
+                    event(db, lead["id"], "Finance" if row["kind"] == "invoice" else "Outreach" if row["kind"] == "cold_email" else "Client Success", f"{row['kind']}.{status}", "Demo action; no external request" if lead["demo"] else "Provider accepted the request; delivery confirmation is separate")
+            except Exception as exc:
+                with connect() as db:
+                    db.execute("UPDATE outbox SET status='uncertain',result=? WHERE id=?", (str(exc) if isinstance(exc, Blocked) else type(exc).__name__, row["id"]))
+                    event(db, lead["id"], "CRM", "action.uncertain", f"{row['kind']} needs reconciliation; automatic retries disabled to avoid duplicate side effects")
+
+
+def reconcile_action(action_id, outcome, evidence, provider_id=None):
+    with LOCK, connect() as db:
+        row = unpack(db.execute("SELECT * FROM outbox WHERE id=?", (action_id,)).fetchone())
+        if not row:
+            raise KeyError(action_id)
+        if row["status"] != "uncertain":
+            raise Blocked("Only an uncertain action can be reconciled.")
+        if outcome == "not_sent":
+            db.execute("UPDATE outbox SET status='pending',result=? WHERE id=?", ("Operator confirmed no provider effect: " + evidence, action_id))
+        elif outcome == "sent":
+            if not provider_id:
+                raise Blocked("A provider receipt or invoice ID is required to confirm an action.")
+            result = {"id": provider_id, "reconciled": True}
+            db.execute("UPDATE outbox SET status='done',result=? WHERE id=?", (json.dumps(result), action_id))
+            if row["payload"].get("approval_id"):
+                db.execute("UPDATE approvals SET status='executed',result=? WHERE id=?", (json.dumps(result), row["payload"]["approval_id"]))
+            if row["kind"] == "invoice":
+                lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (row["lead_id"],)).fetchone())
+                lead["details"]["invoice"] = {**result, "amount": row["payload"]["amount"], "currency": row["payload"]["currency"]}
+                save_lead(db, lead)
+            db.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?)", (uid("msg_"), row["lead_id"], "outbound", row["payload"].get("subject", "Reconciled action"), row["payload"].get("body", ""), "confirmed_by_operator", provider_id, now()))
+        else:
+            raise Blocked("Invalid reconciliation outcome.")
+        event(db, row["lead_id"], "Human", "action.reconciled", f"{row['kind']} / {outcome} / {evidence}")
+        return {"status": "reconciled", "outcome": outcome}
+
+
+def ingest_event(db, provider, payload):
+    event_id = str(payload["id"])
+    key = provider + ":" + event_id
+    if db.execute("SELECT 1 FROM webhooks WHERE id=?", (key,)).fetchone():
+        return {"status": "duplicate"}
+    kind = payload["type"]
+    if provider == "relay" and payload.get("campaign_id") != os.environ.get("OUTREACH_CAMPAIGN_ID"):
+        raise Blocked("Outreach events must identify the configured dedicated campaign.")
+    lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (payload.get("lead_id"),)).fetchone())
+    if not lead and payload.get("email"):
+        lead = unpack(db.execute("SELECT * FROM leads WHERE email=? AND demo=0", (payload["email"].lower(),)).fetchone())
+    if kind != "campaign.health" and not lead:
+        raise Blocked("No matching lead for this event.")
+    if lead and bool(lead["demo"]) != (provider == "demo"):
+        raise Blocked("Demo and live events cannot cross environments.")
+    data = payload.get("data", {})
+    if kind == "call.booked":
+        lead["details"]["call_booked"] = {"start": data.get("start"), "provider": provider, "event_id": event_id}
+        welcome(db, lead)
+    elif kind == "call.notes":
+        if not data.get("notes"):
+            raise Blocked("Call notes cannot be empty.")
+        lead["details"]["call_notes"] = str(data["notes"])[:10000]
+    elif kind == "reply.received":
+        body = str(data.get("body", ""))[:10000]
+        db.execute("INSERT INTO messages VALUES(?,?,?,?,?,?,?,?)", (uid("msg_"), lead["id"], "inbound", str(data.get("subject", "Reply"))[:200], body, "received", event_id, now()))
+        lower = body.lower()
+        if any(word in lower for word in ["unsubscribe", "no thanks", "remove me", "stop emailing"]):
+            db.execute("INSERT OR IGNORE INTO suppressions VALUES(?,?,?)", (lead["email"], "Client opt out", now()))
+            lead["status"] = "suppressed"
+        elif any(word in lower for word in ["discount", "contract", "guarantee", "refund", "liability", "price", "cost", "budget"]):
+            approval(db, lead, "sales_exception", f"Review sales request from {lead['name']}", {"request": body, "reason": "Money, legal terms or policy exception; compose an approved response manually."})
+            lead["status"] = "approval"
+        else:
+            link = "https://example.com/demo-booking" if lead["demo"] else os.environ.get("BOOKING_URL", "")
+            if not link:
+                raise Blocked("Configure BOOKING_URL before replying to prospects.")
+            # Draft replies are held until the outreach provider's thread identity is configured.
+            reply = {"subject": "Re: A quick conversation", "body": f"Thanks for getting back to us. We can discuss the scope on a short call. Choose a time here: {link}", "thread_id": data.get("thread_id"), "provider_lead_id": data.get("provider_lead_id")}
+            if lead["demo"] or data.get("thread_id"):
+                queue(db, lead, "sales_reply", reply, f"{lead['id']}:reply:{event_id}")
+            else:
+                lead["details"]["reply_draft"] = reply
+                event(db, lead["id"], "Sales", "reply.drafted", "Provider thread mapping required before sending this reply")
+    elif kind == "invoice.paid":
+        invoice = lead["details"].get("invoice", {})
+        if provider not in {"stripe", "demo"} or data.get("invoice_id") != invoice.get("id") or data.get("amount_paid") != invoice.get("amount") or data.get("currency", "").lower() != invoice.get("currency", "").lower():
+            raise Blocked("Payment must match the approved invoice ID, amount and currency through a trusted Stripe event.")
+        lead["details"]["paid_at"] = now()
+    elif kind in {"email.bounced", "email.unsubscribed"}:
+        db.execute("INSERT OR IGNORE INTO suppressions VALUES(?,?,?)", (lead["email"], kind, now()))
+        lead["status"] = "suppressed"
+        if kind == "email.bounced" and provider != "demo":
+            health = setting(db, "outreach_health", {"sent": 0, "bounced": 0})
+            health["bounced"] = health.get("bounced", 0) + 1
+            health["checked_at"] = now()
+            threshold = float(os.environ.get("MAX_BOUNCE_RATE", "0.02"))
+            health["paused"] = bool(health.get("paused")) or health["bounced"] / max(1, health.get("sent", 0)) >= threshold
+            set_setting(db, "outreach_health", health)
+            if health["paused"]:
+                set_setting(db, "pause_provider_pending", True)
+    elif kind == "email.sent":
+        if provider != "demo":
+            health = setting(db, "outreach_health", {"sent": 0, "bounced": 0})
+            health["sent"] = health.get("sent", 0) + 1
+            health["checked_at"] = now()
+            set_setting(db, "outreach_health", health)
+    elif kind == "campaign.health":
+        if provider == "demo":
+            raise Blocked("Demo events cannot modify live campaign health.")
+        sent, bounced = int(data.get("sent", 0)), int(data.get("bounced", 0))
+        if sent < 0 or bounced < 0 or bounced > sent:
+            raise Blocked("Invalid campaign counters.")
+        previous = setting(db, "outreach_health", {})
+        paused = bool(previous.get("paused")) or (bounced / max(1, sent)) >= float(os.environ.get("MAX_BOUNCE_RATE", "0.02"))
+        set_setting(db, "outreach_health", {"sent": sent, "bounced": bounced, "paused": paused, "checked_at": now()})
+        if paused:
+            set_setting(db, "pause_provider_pending", True)
+    else:
+        raise Blocked("Unsupported event type.")
+    db.execute("INSERT INTO webhooks VALUES(?,?,?)", (key, provider, now()))
+    if lead:
+        save_lead(db, lead)
+    event(db, lead["id"] if lead else None, "CRM", kind, f"Event recorded from {provider}: {event_id}")
+    return {"status": "accepted"}
+
+
+def weekly_reports():
+    with LOCK, connect() as db:
+        for row in db.execute("SELECT * FROM leads WHERE stage BETWEEN 6 AND 10 AND status NOT IN ('rejected','suppressed','closed')"):
+            lead = unpack(row)
+            d = lead["details"]
+            last = datetime.fromisoformat(d.get("last_report_at", lead["created_at"]))
+            if datetime.now(timezone.utc) - last < timedelta(days=7):
+                continue
+            week = datetime.now(timezone.utc).strftime("%G-W%V")
+            recent = [row[0] for row in db.execute("SELECT detail FROM events WHERE lead_id=? AND action IN ('delivery.generated','quality.checked','document.created') ORDER BY created_at DESC LIMIT 3", (lead["id"],))]
+            queue(db, lead, "report", {"subject": f"{lead['name']} — your weekly ZanDop update", "body": f"This week, your project is in {STAGES[lead['stage']-1]['name']}.\n\nProgress:\n" + "\n".join(recent)[:1800] + f"\n\nNext: {STAGES[min(lead['stage'],10)]['description']}\n\nWe will keep you posted on decisions and milestones."}, f"{lead['id']}:report:{week}")
+            d["last_report_at"] = now()
+            save_lead(db, lead)
+            event(db, lead["id"], "Reporting", "report.queued", week)
+
+
+def cycle(include_demo=True):
+    with LOCK:
+        with connect() as db:
+            ids = [row[0] for row in db.execute("SELECT id FROM leads WHERE (? OR demo=0) AND status NOT IN ('closed','rejected','suppressed')", (include_demo,))]
+        for lead_id in ids:
+            advance(lead_id)
+        weekly_reports()
+        drain_outbox()
+        if live_enabled():
+            with connect() as db:
+                pending = setting(db, "pause_provider_pending", False)
+            if pending:
+                try:
+                    integrations.pause_campaign()
+                    with connect() as db:
+                        set_setting(db, "pause_provider_pending", False)
+                        event(db, None, "Outreach", "campaign.paused", "Provider campaign pause confirmed")
+                except Exception:
+                    with connect() as db:
+                        event(db, None, "Outreach", "campaign.pause_failed", "Local sends blocked; provider pause still needs attention")
+        return {"processed": len(ids)}
+
+
+def discover_configured_sources():
+    if not live_enabled():
+        return
+    from .discovery import discover_source
+    sources = json.loads(os.environ.get("ZANDOP_SOURCES", "[]"))
+    with LOCK, connect() as db:
+        last = setting(db, "discovery_last_run")
+        if last and datetime.now(timezone.utc) - datetime.fromisoformat(last) < timedelta(hours=6):
+            return
+        for source in sources:
+            try:
+                if source.get("service") not in {"ecommerce", "website", "content"}:
+                    raise Blocked("Each discovery source needs a valid service.")
+                records = discover_source(source["url"], source["kind"], source["service"])
+                added = 0
+                for record in records:
+                    if not db.execute("SELECT 1 FROM leads WHERE email=? AND demo=0", (record["email"],)).fetchone():
+                        add_lead(db, record)
+                        added += 1
+                event(db, None, "Lead Finder", "discovery.completed", f"{source['kind']}: {added} new businesses with published contact details")
+            except Exception as exc:
+                event(db, None, "Lead Finder", "discovery.blocked", str(exc) if isinstance(exc, Blocked) else "Source could not be processed")
+        if sources:
+            set_setting(db, "discovery_last_run", now())
+
+
+def seed_demo():
+    with LOCK, connect() as db:
+        if db.execute("SELECT 1 FROM leads WHERE demo=1").fetchone():
+            return
+        specs = [("Forma Studio", "ecommerce", "Shopify", "Home & living", 8), ("Olive & Earth", "website", "WordPress", "Sustainable skincare", 6), ("Northstar Coffee", "content", "Custom", "Specialty coffee", 4), ("Arc Athletics", "ecommerce", "WooCommerce", "Sport & wellness", 3), ("The Good Edit", "content", "WordPress", "Independent publishing", 2), ("Monogram", "website", "React", "Architecture & interiors", 1)]
+        for index, (name, service, platform, industry, target) in enumerate(specs):
+            lead = add_lead(db, {"name": name, "email": f"hello{index}@example.com", "website": f"https://example.com/{index}", "service": service, "platform": platform, "industry": industry, "source": ["shopify_directory", "google_maps", "linkedin", "woocommerce_directory", "job_board", "manual"][index], "details": {"revenue_score": 22-index, "traffic_score": 20-index, "visual_score": 30-index, "brand_voice": "Warm, considered, and quietly confident.", "keywords": ["thoughtful design", "everyday essentials"], "goals": "Build a clear, considered digital experience that turns interest into action."}}, demo=True)
+            lead["details"]["score_components"] = score_lead(lead)
+            lead["score"] = lead["details"]["score_components"]["total"]
+            if target > 2:
+                lead["details"]["research"] = research(lead)
+                create_document(db, lead, "brief")
+            if target >= 4:
+                lead["details"]["call_booked"] = {"start": "Demo booking", "provider": "demo"}
+                lead["details"]["call_notes"] = "The client wants a clearer customer journey, a confident visual direction, and a simple handoff. Prioritize mobile usability and a focused first release."
+                welcome(db, lead)
+            if target > 6:
+                doc = create_document(db, lead, "plan")
+                lead["details"]["plan_document"] = doc["id"]
+                lead["details"]["delivery"] = generate_delivery(db, lead)
+                lead["details"]["quality"] = quality_check(lead)
+                lead["stage"] = 8
+                approval(db, lead, "final_delivery", f"Approve final delivery for {name}", {"checks": lead["details"]["quality"], "files": lead["details"]["delivery"]["files"], "subject": f"{name} — final deliverables", "body": "Your approved deliverables are attached.", "attachment": lead["details"]["delivery"]["path"]})
+            if target == 4:
+                rate = rate_for(service, True)
+                approval(db, lead, "proposal", f"Review proposal for {name}", {"amount": rate["amount"], "currency": rate["currency"], "scope": "Demo editorial launch package", "subject": "Project proposal", "body": "Illustrative scope and pricing for demonstration only."})
+            lead["stage"], lead["status"] = target, "approval" if target in {4,8} else "ready"
+            save_lead(db, lead)

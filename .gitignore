@@ -1,0 +1,9 @@
+.venv/
+.venv-local/
+.local-demo/
+.env
+__pycache__/
+*.pyc
+data/
+.pytest_cache/
+test-results/

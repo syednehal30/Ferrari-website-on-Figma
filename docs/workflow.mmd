@@ -1,0 +1,24 @@
+flowchart LR
+  subgraph ZanDop[ZanDop — agency orchestration]
+    direction LR
+    A[01 Lead Finder] --> B[02 Researcher]
+    B --> C[03 Outreach Agent]
+    C --> D[04 Sales Agent]
+    D --> E[05 CRM Agent]
+    E --> F[06 Client Success]
+    F --> G[07 Delivery]
+    G --> H[08 Quality Agent]
+    H --> I[09 Finance Agent]
+    I --> J[10 Reporting Agent]
+    J --> K[11 Referral Agent]
+  end
+  Booking[Signed booking event] -. Immediate welcome PDF .-> F
+  Notes[Call notes / transcript] -. Personalized project plan .-> F
+  G -.-> Store[Shopify / WooCommerce]
+  G -.-> Web[WordPress / React / React Native]
+  G -.-> Writer[Brand voice + SEO writer]
+  Human[Human approval] -. Proposal / legal .-> D
+  Human -. Final deliverables .-> H
+  Human -. Exact invoice amount .-> I
+  Audit[(Timestamped CRM + action queue)] -. All stages .-> E
+  K -. 30 days after close .-> Referral[Unique referral tracking link]
