@@ -1,4 +1,4 @@
-"""Install and open the local demo. Uses only the standard library to bootstrap."""
+"""Open the real local workspace by default; use --demo for fictional clients."""
 
 import argparse
 import hashlib
@@ -123,7 +123,9 @@ def instance_lock(directory):
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def serve(open_browser=True, workspace=False):
+def serve(open_browser=True, workspace=True):
+    if workspace and (os.environ.get("ZANDOP_LOCAL_WORKSPACE") != "true" or not os.environ.get("ZANDOP_OPERATOR_TOKEN") or not os.environ.get("ZANDOP_LOCAL_BOOTSTRAP")):
+        raise RuntimeError("Start the real workspace with Start ZanDop.bat or python scripts/local_demo.py; --serve is an internal option.")
     if not workspace:
         os.environ.update({"ZANDOP_LIVE_MODE": "false", "ZANDOP_SEED_DEMO": "true", "ZANDOP_OPERATOR_TOKEN": ""})
         os.environ.pop("ZANDOP_LOCAL_WORKSPACE", None)
@@ -188,10 +190,13 @@ def serve(open_browser=True, workspace=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Install and open the ZanDop local demo.")
-    parser.add_argument("--workspace", action="store_true", help="Open the real local workspace; Gmail automation starts paused.")
+    parser = argparse.ArgumentParser(description="Install and open the real ZanDop workspace. Gmail starts paused until configured.")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--workspace", dest="workspace", action="store_true", help="Open the real local workspace (the default).")
+    modes.add_argument("--demo", dest="workspace", action="store_false", help="Open the separate fictional demo; no real messages send.")
+    parser.set_defaults(workspace=True)
     parser.add_argument("--no-browser", action="store_true", help="Start without opening a browser.")
-    parser.add_argument("--data-dir", type=Path, help="Optional separate demo data folder.")
+    parser.add_argument("--data-dir", type=Path, help="Optional separate data folder for the selected workspace.")
     parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if sys.version_info[:2] != (3, 12):
@@ -203,8 +208,7 @@ def main():
     command = [str(python), str(Path(__file__).resolve()), "--serve"]
     if args.no_browser:
         command.append("--no-browser")
-    if args.workspace:
-        command.append("--workspace")
+    command.append("--workspace" if args.workspace else "--demo")
     environment = workspace_environment(browser, args.data_dir) if args.workspace else demo_environment(browser, args.data_dir)
     run(command, env=environment)
 
@@ -213,7 +217,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nZanDop stopped. Your saved demo data is kept.")
+        print("\nZanDop stopped. Your saved workspace data is kept.")
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         print("\nZanDop could not start: " + str(exc), file=sys.stderr)
         print("Keep this window open to read the error. Internet is required for the first installation.", file=sys.stderr)

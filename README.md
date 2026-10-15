@@ -2,7 +2,7 @@
 
 Free, MIT-licensed agency workflow software for Windows: personal Gmail outreach, a client email inbox, service-specific questionnaires, manual quotes starting at **$500 USD**, branded PDFs, project starters, quality checks, Payoneer request approvals, and a shared CRM. Your data stays on your computer. No Instantly, Smartlead, extra domain, paid hosting or paid AI API is required for the local workflow.
 
-**Start here: [Windows setup](WINDOWS-START-HERE.md).** Use **Start ZanDop Workspace.bat** for real clients, or **Start ZanDop.bat** for the fictional demo. The real workspace starts with email automation paused and no sample clients.
+**Start here: [Windows setup](WINDOWS-START-HERE.md).** Use **Start ZanDop.bat** (or **Start ZanDop Workspace.bat**) for real clients. **Open ZanDop Demo.bat** explicitly opens the separate fictional demo. The real workspace starts with email automation paused and no sample clients.
 
 This is an operational workflow application with bounded automatic replies, not a guarantee that an entire agency or every client conversation can run without intervention. Deliverables are unpublished starters and drafts that need final human review. Live Gmail and Payoneer transactions have not been tested with the owner's accounts.
 
@@ -81,6 +81,6 @@ make test
 .venv/bin/python tests/local_browser_smoke.py
 ```
 
-For the local launcher: `python scripts/local_demo.py --workspace`; omit `--workspace` for the demo. The real launcher ignores `.env` and starts with local settings; advanced cloud adapters use the existing environment-based scripts. Use the existing checkout; cloud tasks are isolated and do not require worktrees.
+For the local launcher: `python scripts/local_demo.py` opens the real workspace by default; use `--demo` for the separate fictional demo. The existing `--workspace` option remains supported. The real launcher ignores `.env` and starts with local settings; advanced cloud adapters use the existing environment-based scripts. Use the existing checkout; cloud tasks are isolated and do not require worktrees.
 
 Tests exercise the complete demo and email-only journey, actual PDFs, Gmail parsing/polling and SMTP behavior with fake transports, price floor, quote revision, client acceptance, exact-payload/attachment approval, Payoneer confirmation, replay protection, uncertain sends, daily sending limits, exact outreach reviews, project capacity, delivery-status suppression, selective inbox import, public contact discovery, auth and browser controls. No tests send real email or payments. Linux bootstrap and browser behavior are tested here; actual Windows launcher/DPAPI behavior and account-specific Gmail authentication still need verification on the owner's PC.

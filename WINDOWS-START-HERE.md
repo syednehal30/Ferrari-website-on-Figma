@@ -4,10 +4,20 @@
 
 1. Install **Python 3.12**. The official [Python Install Manager](https://www.python.org/downloads/windows/) can install it using `py install 3.12` in Terminal. Skip this if Python 3.12 is already installed.
 2. Download the updated repository ZIP and choose **Extract All**. Keep the entire extracted folder, for example in `Documents\ZanDop`. Do not launch files inside the ZIP preview.
-3. Double-click **Start ZanDop Workspace.bat** for your real agency. It installs dependencies the first time and opens the local dashboard. Keep the command window open.
-4. To try fictional clients instead, double-click **Start ZanDop.bat**. Demo data and real client data are separate.
+3. Double-click **Start ZanDop.bat** for your real agency. **Start ZanDop Workspace.bat** does the same thing. It installs dependencies the first time and opens the local dashboard. Keep the command window open.
+4. To try fictional clients instead, double-click **Open ZanDop Demo.bat**. Demo data and real client data are separate.
 
 No hosting account, Docker, Stripe account or paid AI subscription is needed. The software is open source under the MIT license. Payoneer and optional external services can still charge their own fees.
+
+## If you still see “Demo workspace”
+
+1. Close the old demo command window and its browser tab.
+2. Download version **0.3.1 or later** and extract it into a fresh folder. Keep your data folders; do not delete client data.
+3. Open **Start ZanDop.bat** or **Start ZanDop Workspace.bat** from that newly extracted folder. Avoid old shortcuts and bookmarked browser tabs.
+4. A new real workspace opens **Local setup**, shows **Real workspace · setup needed**, and has no Forma Studio or other sample clients. The Gmail fields are enabled.
+5. Connect Gmail using the steps below. The top badge changes as you complete setup; “paused” means real automation is waiting for you to enable it.
+
+Your real data in `%LOCALAPPDATA%\ZanDop\workspace` is reused across downloads. The demo is stored separately in `%LOCALAPPDATA%\ZanDop\demo`. Older versions used the short **Start ZanDop.bat** filename for the demo; this has been corrected. If you enabled Windows auto-start, disable it from the old extracted folder and enable it again from the new folder to update its shortcut.
 
 ## Connect Gmail on this computer
 

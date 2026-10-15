@@ -1,19 +1,19 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title ZanDop - Local Demo
+title ZanDop - Local Workspace
 echo.
-echo ZanDop - Local Demo
+echo ZanDop - Local Workspace
 echo First launch installs dependencies. Keep this window open while using ZanDop.
 echo.
 py -3.12 -c "import sys; assert sys.version_info[:2] == (3, 12)" >nul 2>&1
 if not errorlevel 1 (
-    py -3.12 scripts\local_demo.py
+    py -3.12 scripts\local_demo.py --workspace
     goto finished
 )
 python -c "import sys; assert sys.version_info[:2] == (3, 12)" >nul 2>&1
 if not errorlevel 1 (
-    python scripts\local_demo.py
+    python scripts\local_demo.py --workspace
     goto finished
 )
 echo Python 3.12 is required for this version of ZanDop.

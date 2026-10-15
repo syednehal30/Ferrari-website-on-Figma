@@ -193,7 +193,7 @@ async def lifespan(app):
         pass
 
 
-app = FastAPI(title="ZanDop Agency OS", version="0.3.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="ZanDop Agency OS", version="0.3.1", lifespan=lifespan, docs_url=None, redoc_url=None)
 
 
 @app.middleware("http")
@@ -246,14 +246,15 @@ def workspace_mode():
 
 @app.get("/local/session")
 def local_session(request: Request, code: str):
+    destination = "/#local-setup" if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true" and not mailbox.public_status()["verified"] else "/"
     current = os.environ.get("ZANDOP_OPERATOR_TOKEN", "")
     if current and hmac.compare_digest(request.cookies.get("zandop_session", ""), current):
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse(destination, status_code=303)
     expected = os.environ.get("ZANDOP_LOCAL_BOOTSTRAP", "")
     if not expected or not hmac.compare_digest(code, expected):
         raise HTTPException(401, "Reopen the workspace using its Windows launcher.")
     os.environ.pop("ZANDOP_LOCAL_BOOTSTRAP", None)
-    response = RedirectResponse("/", status_code=303)
+    response = RedirectResponse(destination, status_code=303)
     response.set_cookie("zandop_session", os.environ["ZANDOP_OPERATOR_TOKEN"], httponly=True, samesite="strict")
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -302,7 +303,7 @@ def state():
         actions = [unpack(row) for row in db.execute("SELECT id,lead_id,kind,status,result,created_at FROM outbox WHERE status IN ('pending','blocked','uncertain') ORDER BY created_at DESC")]
         return {"leads": leads, "approvals": approvals, "documents": documents, "events": events, "stages": engine.STAGES,
                 "providers": provider_status(), "outbox": actions, "mode": workspace_mode(), "outreach_health": setting(db, "outreach_health", {}), "updated_at": now(),
-                "mailbox": mailbox.public_status(), "ollama_model": setting(db, "ollama_model", ""), "minimum_package": 50000, "growth": growth.dashboard()}
+                "mailbox": mailbox.public_status(), "ollama_model": setting(db, "ollama_model", ""), "minimum_package": 50000, "growth": growth.dashboard(), "version": app.version}
 
 
 @app.post("/api/leads", status_code=201)
@@ -406,6 +407,10 @@ def automation(body: Toggle):
 
 @app.post("/api/local/poll")
 def check_mail():
+    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") != "true":
+        raise Blocked("The demo cannot read Gmail. Open Start ZanDop.bat from the updated download for your real workspace.")
+    if not live_enabled():
+        raise Blocked("Automatic replies are paused. Connect and test Gmail, then enable automatic replies in Local setup before checking for new mail.")
     result = mailbox.poll()
     engine.drain_outbox()
     return result

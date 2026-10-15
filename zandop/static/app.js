@@ -56,8 +56,13 @@ async function api(path, options={}) {
   return result;
 }
 
-async function refresh() {
-  state = await api('/state');
+function editingForm() {
+  return !!document.querySelector('form[data-dirty="true"]') || !!document.activeElement?.closest('form');
+}
+async function refresh(background=false) {
+  const next = await api('/state');
+  if(background && (editingForm() || document.querySelector('.modal')))return;
+  state = next;
   render();
 }
 function toast(message,error=false) {
@@ -75,12 +80,12 @@ function render() {
   page = location.hash.slice(1).split('?')[0] || 'overview';
   if(!nav.some(n=>n[0]===page)) page='overview';
   document.getElementById('breadcrumb').textContent = nav.find(n=>n[0]===page)[1];
-  document.getElementById('mode-pill').textContent = state.mode==='demo' ? 'Demo workspace' : state.mode==='paused' ? 'Local · replies paused' : 'Local · replies enabled';
+  document.getElementById('mode-pill').textContent = state.mode==='demo' ? 'Demo workspace' : !state.mailbox.verified ? 'Real workspace · setup needed' : state.mode==='paused' ? 'Real workspace · paused' : 'Real workspace · running';
   document.getElementById('notification-button').innerHTML=icon('bell');
   document.getElementById('navigation').innerHTML=nav.map(([id,title,ico])=>`<a href="#${id}" class="nav-item ${page===id?'active':''}" ${page===id?'aria-current="page"':''}>${icon(ico)}<span>${title}</span>${id==='approvals' && pending().length?`<span class="nav-count">${pending().length}</span>`:''}</a>`).join('');
-  document.getElementById('last-sync').textContent = `Updated ${new Intl.DateTimeFormat('en-US',{hour:'numeric',minute:'2-digit',timeZone:'Asia/Karachi'}).format(new Date(state.updated_at))} PKT`;
+  document.getElementById('last-sync').textContent = `v${state.version||'0.3.1'} · Updated ${new Intl.DateTimeFormat('en-US',{hour:'numeric',minute:'2-digit',timeZone:'Asia/Karachi'}).format(new Date(state.updated_at))} PKT`;
   const views = {growth:leadFinder,overview,workflow,crm,inbox,documents,approvals,integrations,activity,'local-setup':localSetup};
-  document.getElementById('main').innerHTML=views[page]();
+  document.getElementById('main').innerHTML=(state.mode==='demo'?`<div class="callout" role="status"><strong>Demo only — these are fictional clients.</strong><p>To use your Gmail, close this demo and open <b>Start ZanDop.bat</b> or <b>Start ZanDop Workspace.bat</b> in the updated download. A real workspace opens Local setup and has no sample clients. The demo sends no real emails.</p><a class="btn" href="#local-setup">View setup instructions</a></div>`:'')+views[page]();
 }
 
 function heading(eyebrow,title,subtitle,actions='') {
@@ -89,7 +94,8 @@ function heading(eyebrow,title,subtitle,actions='') {
 function metrics() {
   const liveProjects=state.leads.filter(l=>l.stage>=6&&l.stage<=10).length;
   const demoValue=state.approvals.filter(a=>a.demo&&a.kind==='proposal').reduce((sum,a)=>sum+(a.payload.amount||0),0);
-  const data=[['Leads in your orbit',state.leads.length,'users','Imported & scored','positive'],['Projects in motion',liveProjects,'code','From welcome to handoff','positive'],['Your attention needed',pending().length,'shield','Human checkpoints','attention'],['Demo proposal value',money(demoValue),'wallet','Illustrative · not revenue','']];
+  const valueCard=state.mode==='demo'?['Demo proposal value',money(demoValue),'wallet','Illustrative · not revenue','']:['Accepted scope value',money(state.growth.capacity.booked_amount),'wallet','This week · payment verified separately',''];
+  const data=[['Leads in your orbit',state.leads.length,'users','Imported & scored','positive'],['Projects in motion',liveProjects,'code','From welcome to handoff','positive'],['Your attention needed',pending().length,'shield','Human checkpoints','attention'],valueCard];
   return `<div class="metrics">${data.map(([title,value,ico,caption,cls],i)=>`<div class="metric"><div class="metric-top">${title}<span class="metric-icon">${icon(ico)}</span></div><strong>${value}</strong><div class="metric-foot"><span class="${cls}">${i===2?'◷':i<2?'+':'○'}</span>${caption}</div>${i!==2?`<svg class="metric-spark" viewBox="0 0 80 30" aria-hidden="true"><path d="M1 ${24-i*3} 12 21 20 24 31 13 42 17 53 8 64 12 79 3" fill="none" stroke="${i===3?'#b9a2d0':'#a3c1ad'}" stroke-width="1.8"/></svg>`:''}</div>`).join('')}</div>`;
 }
 function pipeline() {
@@ -111,8 +117,8 @@ function overview() {
   const date=new Intl.DateTimeFormat('en-US',{weekday:'long',month:'long',day:'numeric',timeZone:'Asia/Karachi'}).format(new Date());
   const doc=state.documents.find(d=>d.kind==='welcome');
   return heading(date,'Your agency, in motion.','A little less busywork. A lot more room to do great work.',button('Add a lead','new-lead','plus')+button('Run next cycle','run','play','primary'))+
-  metrics()+`<section class="panel pipeline-panel"><div class="panel-header"><div><div class="panel-title"><h2>One connected client journey</h2><span class="tiny-label">11 specialist agents</span></div><p>From the first opportunity to the next introduction.</p></div><a href="#workflow" class="text-link">View workflow ${icon('arrow')}</a></div>${pipeline()}<div class="pipeline-bottom"><span>${icon('database')} Every step recorded in your CRM</span><span>${icon('shield')} Human approval where it matters</span></div></section>
-  <div class="main-grid"><div class="stack"><section class="panel"><div class="panel-header"><div class="panel-title"><h2>On your radar</h2><span class="count-pill">${state.leads.length}</span></div><a href="#crm" class="text-link">All leads ${icon('arrow')}</a></div>${leadTable(state.leads.slice(0,5))}<div class="table-footer"><span>${Math.min(state.leads.length,5)} of ${state.leads.length} leads · Sample clients are labeled Demo</span><a href="#crm">View all →</a></div></section><section class="panel"><div class="panel-header"><h2>Behind the scenes</h2><a href="#activity" class="text-link">Activity log ${icon('arrow')}</a></div><div class="activity-list">${activityItems(state.events.slice(0,3))}</div></section></div>
+  (state.mode!=='demo'&&!state.mailbox.enabled?`<div class="callout"><strong>${state.mailbox.verified?'Gmail is connected. Automation is paused.':'Your real workspace is open. Connect Gmail to begin.'}</strong><p>${state.mailbox.verified?'Enable automatic replies in Local setup when you are ready.':'There are no sample clients here. Connect and test your Gmail, then enable automatic replies. Add your own prospects in Lead finder.'}</p><a class="btn primary" href="#local-setup">Continue setup</a></div>`:'')+metrics()+`<section class="panel pipeline-panel"><div class="panel-header"><div><div class="panel-title"><h2>One connected client journey</h2><span class="tiny-label">11 specialist agents</span></div><p>From the first opportunity to the next introduction.</p></div><a href="#workflow" class="text-link">View workflow ${icon('arrow')}</a></div>${pipeline()}<div class="pipeline-bottom"><span>${icon('database')} Every step recorded in your CRM</span><span>${icon('shield')} Human approval where it matters</span></div></section>
+  <div class="main-grid"><div class="stack"><section class="panel"><div class="panel-header"><div class="panel-title"><h2>On your radar</h2><span class="count-pill">${state.leads.length}</span></div><a href="#crm" class="text-link">All leads ${icon('arrow')}</a></div>${leadTable(state.leads.slice(0,5))}<div class="table-footer"><span>${Math.min(state.leads.length,5)} of ${state.leads.length} leads${state.mode==='demo'?' · Sample clients are labeled Demo':''}</span><a href="#crm">View all →</a></div></section><section class="panel"><div class="panel-header"><h2>Behind the scenes</h2><a href="#activity" class="text-link">Activity log ${icon('arrow')}</a></div><div class="activity-list">${activityItems(state.events.slice(0,3))}</div></section></div>
   <div class="stack right-stack"><section class="panel"><div class="panel-header"><div class="panel-title"><h2>A human touch</h2><span class="count-pill">${pending().length}</span></div><span class="tiny-label">YOUR CHECKPOINT</span></div><div class="approval-list">${pending().slice(0,2).map(a=>`<div class="approval-mini"><span class="approval-symbol">${icon(a.kind==='invoice'?'wallet':a.kind==='final_delivery'?'shield':'file')}</span><div class="approval-mini-content"><h3>${a.kind==='final_delivery'?'Ready for a final look':a.kind==='invoice'?'An invoice to approve':'A proposal to review'}</h3><p>${h(a.client)} · ${a.kind==='proposal'&&a.payload.amount?money(a.payload.amount,a.payload.currency):'Your approval comes first'}</p>${button('Review '+(a.kind==='final_delivery'?'delivery':a.kind==='invoice'?'invoice':'proposal'),'approval','arrow','small',`data-id="${a.id}"`)}</div></div>`).join('')||'<div class="empty">All clear. No pending approvals.</div>'}</div><div class="human-footer">${icon('lock')} Money, legal & final delivery stay with you.</div></section>
   <section class="panel"><div class="panel-header"><h2>First impressions, made to last.</h2>${icon('spark')}</div><div class="doc-feature"><div><span class="eyebrow" style="font-size:8px">THE CLIENT EXPERIENCE</span><h3>A warm welcome.<br>A clear way forward.</h3><p>Beautifully branded documents,<br>personalized for every client.</p>${doc?`<a class="btn ghost" href="/api/documents/${doc.id}/download" target="_blank" rel="noopener">Open welcome PDF ${icon('arrow')}</a>`:'<a href="#documents" class="text-link">Explore documents →</a>'}</div>${paper(doc?.client||'Your next client')}</div></section></div></div>
   <div class="bottom-banner"><span>${icon('shield')}<span><strong>${state.mode==='demo'?'Space to explore. Nothing sends.':'Your policies stay in control.'}</strong> ${state.mode==='demo'?'Demo clients, simulated actions, and real documents. Live outreach is disabled.':'Approvals, delivery checks and bounce protection guard external actions.'}</span></span><a href="#integrations" class="text-link">Manage integrations ${icon('arrow')}</a></div>`;
@@ -221,7 +227,11 @@ document.addEventListener('submit',async event=>{
   }catch(error){toast(error.message,true);}finally{if(submit)submit.disabled=false;}
 });
 document.addEventListener('input',event=>{
+  const form=event.target.closest('form');if(form)form.dataset.dirty='true';
   if(event.target.id==='lead-search') {const position=event.target.selectionStart;search=event.target.value;render();const input=document.getElementById('lead-search');input.focus();if(input.type!=='search')input.setSelectionRange(position,position);}
+});
+document.addEventListener('change',event=>{
+  const form=event.target.closest('form');if(form)form.dataset.dirty='true';
 });
 document.addEventListener('keydown',event=>{
   if(event.key==='Escape') {closeModal();document.getElementById('sidebar').classList.remove('open');}
@@ -237,4 +247,4 @@ document.getElementById('menu-toggle').addEventListener('click',()=>document.get
 document.getElementById('notification-button').addEventListener('click',()=>location.hash='approvals');
 window.addEventListener('hashchange',()=>{filter='all';search='';document.getElementById('sidebar').classList.remove('open');render();});
 refresh().catch(error=>toast(error.message,true));
-setInterval(()=>{if(state&&!busy&&!document.querySelector('.modal'))refresh().catch(()=>{});},30000);
+setInterval(()=>{if(state&&!busy&&!editingForm()&&!document.querySelector('.modal'))refresh(true).catch(()=>{});},30000);

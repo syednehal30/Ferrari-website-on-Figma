@@ -26,7 +26,7 @@ def main():
         for key in ("GMAIL_ADDRESS", "GMAIL_APP_PASSWORD", "GMAIL_LABEL"):
             config.pop(key, None)
         with (directory / "server.log").open("w") as log:
-            server = subprocess.Popen([sys.executable, "scripts/local_demo.py", "--serve", "--workspace", "--no-browser"], cwd=root, env=config, stdout=log, stderr=log)
+            server = subprocess.Popen([sys.executable, "scripts/local_demo.py", "--serve", "--no-browser"], cwd=root, env=config, stdout=log, stderr=log)
             try:
                 for _ in range(100):
                     if (directory / "Open ZanDop.html").is_file():
@@ -45,13 +45,19 @@ def main():
                     errors = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(self_login, wait_until="networkidle")
-                    page.get_by_role("heading", name="Your agency, in motion.").wait_for()
-                    assert page.request.get(address + "/api/state").json()["mode"] == "paused"
-                    page.goto(address + "/#local-setup")
                     page.get_by_role("heading", name="Set up your local agency.").wait_for()
+                    initial = page.request.get(address + "/api/state").json()
+                    assert initial["mode"] == "paused" and initial["leads"] == []
+                    assert page.url.endswith("#local-setup")
+                    assert page.locator('[name="email"]').is_enabled()
+                    assert page.locator('#mode-pill').inner_text() == 'Real workspace · setup needed'
+                    assert page.locator('[name="password"]').is_enabled()
                     page.get_by_role("button", name="Enable automatic replies").click()
                     page.get_by_text("Test your Gmail connection successfully before enabling automatic replies.", exact=True).wait_for()
                     page.goto(address + "/#overview")
+                    page.get_by_text("Your real workspace is open. Connect Gmail to begin.", exact=True).wait_for()
+                    assert page.get_by_text("Demo proposal value", exact=True).count() == 0
+                    page.get_by_text("Accepted scope value", exact=True).wait_for()
                     page.get_by_role("button", name="Add a lead").click()
                     page.locator('[name="name"]').fill("Local Browser Client")
                     page.locator('[name="email"]').fill("local-browser@example.com")
@@ -91,10 +97,16 @@ def main():
                     assert [a["status"] for a in state["approvals"]] == ["pending", "superseded"]
                     page.goto(address + "/#growth")
                     page.get_by_role("heading", name="Find your next two clients.").wait_for()
+                    page.get_by_role("heading", name="What is ready, and what is missing").wait_for()
+                    page.get_by_text("No prospects or directory feeds yet. Paste business website URLs below or import your leads.", exact=True).wait_for()
+                    page.clock.install()
                     page.locator('[name="market"]').fill("Independent furniture stores in Manchester")
                     page.locator('[name="daily_limit"]').fill("8")
+                    page.clock.fast_forward(31000)
+                    assert page.locator('[name="market"]').input_value() == "Independent furniture stores in Manchester", "Automatic refresh must not erase unsaved setup inputs"
+                    assert page.locator('[name="daily_limit"]').input_value() == "8"
                     page.get_by_role("button", name="Save targeting").click()
-                    page.wait_for_function("state.growth.daily_limit === 8")
+                    page.wait_for_function("state.growth.daily_limit === 8 && state.growth.market === 'Independent furniture stores in Manchester'")
                     assert "Independent%20furniture" in page.get_by_role("link", name="Google Maps").get_attribute("href")
                     page.get_by_role("button", name="Enable personal Gmail outreach").click()
                     page.get_by_text("Connect and test your Gmail account in Local setup first.", exact=True).wait_for()
