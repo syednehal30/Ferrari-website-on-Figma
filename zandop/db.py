@@ -58,8 +58,7 @@ def initialize():
           id TEXT PRIMARY KEY, lead_id TEXT NOT NULL REFERENCES leads(id),
           kind TEXT NOT NULL, title TEXT NOT NULL, payload TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
-          decided_at TEXT, decided_by TEXT, result TEXT,
-          UNIQUE(lead_id, kind)
+          decided_at TEXT, decided_by TEXT, result TEXT
         );
         CREATE TABLE IF NOT EXISTS documents (
           id TEXT PRIMARY KEY, lead_id TEXT NOT NULL REFERENCES leads(id),
@@ -84,7 +83,26 @@ def initialize():
         CREATE TABLE IF NOT EXISTS referral_clicks (
           id TEXT PRIMARY KEY, lead_id TEXT NOT NULL REFERENCES leads(id), created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS document_policy (
+          document_id TEXT PRIMARY KEY REFERENCES documents(id), sha256 TEXT NOT NULL,
+          requires_approval INTEGER NOT NULL DEFAULT 0
+        );
         """)
+        # Retain old approvals when a client-specific quote is revised.
+        schema = db.execute("SELECT sql FROM sqlite_master WHERE name='approvals'").fetchone()[0]
+        if "UNIQUE(lead_id, kind)" in schema:
+            db.executescript("""
+            CREATE TABLE approvals_v2 AS SELECT * FROM approvals;
+            DROP TABLE approvals;
+            CREATE TABLE approvals (
+              id TEXT PRIMARY KEY, lead_id TEXT NOT NULL REFERENCES leads(id), kind TEXT NOT NULL,
+              title TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+              created_at TEXT NOT NULL, decided_at TEXT, decided_by TEXT, result TEXT
+            );
+            INSERT INTO approvals SELECT * FROM approvals_v2;
+            DROP TABLE approvals_v2;
+            """)
+        db.execute("CREATE INDEX IF NOT EXISTS approvals_latest ON approvals(lead_id,kind,created_at)")
 
 
 def unpack(row):

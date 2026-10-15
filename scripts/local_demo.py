@@ -3,6 +3,8 @@
 import argparse
 import hashlib
 import json
+import secrets
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import shutil
@@ -62,7 +64,7 @@ def demo_environment(browser=None, data=None):
     prefixes = (
         "ZANDOP_", "OUTREACH_", "INSTANTLY_", "SMARTLEAD_", "CALCOM_", "CALENDLY_",
         "CALENDAR_", "RESEND_", "STRIPE_", "GOOGLE_PLACES_", "MODEL_", "PERSONAL_EMAIL_",
-        "AGENCY_", "BOOKING_", "CLIENT_EMAIL_", "AUTOMATION_WEBHOOK_", "PUBLIC_BASE_",
+        "AGENCY_", "BOOKING_", "CLIENT_EMAIL_", "AUTOMATION_WEBHOOK_", "PUBLIC_BASE_", "GMAIL_",
     )
     env = {key: value for key, value in os.environ.items() if not key.startswith(prefixes)}
     env.pop("CHROMIUM_EXECUTABLE", None)
@@ -80,53 +82,114 @@ def demo_environment(browser=None, data=None):
     return env
 
 
-def serve(open_browser=True):
-    # This path runs only in the installed environment; never honor inherited live settings.
-    os.environ.update({"ZANDOP_LIVE_MODE": "false", "ZANDOP_SEED_DEMO": "true", "ZANDOP_OPERATOR_TOKEN": ""})
+def workspace_environment(browser=None, data=None):
+    default = (Path(os.environ["LOCALAPPDATA"]) / "ZanDop" / "workspace"
+               if os.name == "nt" and os.environ.get("LOCALAPPDATA") else ROOT / ".local-workspace" / "data")
+    env = demo_environment(browser, data or default)
+    env.update({"ZANDOP_LOCAL_WORKSPACE": "true", "ZANDOP_SEED_DEMO": "false",
+                "ZANDOP_OPERATOR_TOKEN": secrets.token_urlsafe(40), "ZANDOP_LOCAL_BOOTSTRAP": secrets.token_urlsafe(40)})
+    for key in ("GMAIL_ADDRESS", "GMAIL_APP_PASSWORD", "GMAIL_LABEL"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    return env
+
+
+@contextmanager
+def instance_lock(directory):
+    path = directory / ".instance.lock"
+    with path.open("a+b") as handle:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError):
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def serve(open_browser=True, workspace=False):
+    if not workspace:
+        os.environ.update({"ZANDOP_LIVE_MODE": "false", "ZANDOP_SEED_DEMO": "true", "ZANDOP_OPERATOR_TOKEN": ""})
+        os.environ.pop("ZANDOP_LOCAL_WORKSPACE", None)
     sys.path.insert(0, str(ROOT))
     import uvicorn
+    directory = Path(os.environ["ZANDOP_DATA_DIR"])
+    directory.mkdir(parents=True, exist_ok=True)
+    state_file = directory / ".instance.json"
+    with instance_lock(directory) as acquired:
+        if not acquired:
+            print("ZanDop is already running for this workspace. Reopening the dashboard.", flush=True)
+            if state_file.is_file() and open_browser:
+                webbrowser.open(json.loads(state_file.read_text())["address"])
+            return
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(128)
+            address = "http://127.0.0.1:" + str(listener.getsockname()[1])
+            state_file.write_text(json.dumps({"address": address}))
+            server = uvicorn.Server(uvicorn.Config("zandop.main:app", workers=1, log_level="warning"))
+            stop_waiting = threading.Event()
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        # An OS-assigned port avoids conflicts with other software. Bind only to this computer.
-        listener.bind(("127.0.0.1", 0))
-        listener.listen(128)
-        address = "http://127.0.0.1:" + str(listener.getsockname()[1])
-        server = uvicorn.Server(uvicorn.Config("zandop.main:app", workers=1, log_level="warning"))
-        stop_waiting = threading.Event()
-
-        def open_when_ready():
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            for _ in range(120):
-                if stop_waiting.is_set():
-                    return
-                try:
-                    with opener.open(address + "/api/state", timeout=2) as response:
-                        state = json.load(response)
-                    if state["mode"] == "demo" and state["leads"]:
-                        print("\nZanDop is ready: " + address, flush=True)
-                        print("Demo only: no real emails, bookings, invoices, or payments.", flush=True)
-                        print("Your data: " + os.environ["ZANDOP_DATA_DIR"], flush=True)
-                        print("Keep this window open. Press Ctrl+C here to stop.\n", flush=True)
-                        if open_browser and not webbrowser.open(address):
-                            print("Open the address above in your browser.", flush=True)
+            def open_when_ready():
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                request = urllib.request.Request(address + "/api/state")
+                if workspace:
+                    request.add_header("Authorization", "Bearer " + os.environ["ZANDOP_OPERATOR_TOKEN"])
+                for _ in range(120):
+                    if stop_waiting.is_set():
                         return
-                except (OSError, ValueError, KeyError, urllib.error.URLError):
-                    pass
-                stop_waiting.wait(0.5)
-            print("Startup is taking longer than expected. Check the error above.", flush=True)
-            server.should_exit = True
+                    try:
+                        with opener.open(request, timeout=2) as response:
+                            state = json.load(response)
+                        if (workspace and state["mode"] in {"paused", "live"}) or (state["mode"] == "demo" and state["leads"]):
+                            print("\nZanDop is ready: " + address, flush=True)
+                            print("Connect Gmail in Local setup. Financial sends always need your approval." if workspace else "Demo only: no real emails, bookings, invoices, or payments.", flush=True)
+                            print("Your data: " + str(directory), flush=True)
+                            print("Keep this window open. Press Ctrl+C here to stop.\n", flush=True)
+                            destination = address
+                            if workspace:
+                                destination += "/local/session?code=" + os.environ["ZANDOP_LOCAL_BOOTSTRAP"]
+                                opener_file = directory / "Open ZanDop.html"
+                                opener_file.write_text('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=' + destination + '"><title>Open ZanDop</title><a href="' + destination + '">Open your local ZanDop workspace</a>', encoding="utf-8")
+                                print("If the browser does not open, double-click: " + str(opener_file), flush=True)
+                            if open_browser:
+                                webbrowser.open(destination)
+                            return
+                    except (OSError, ValueError, KeyError, urllib.error.URLError):
+                        pass
+                    stop_waiting.wait(0.5)
+                print("Startup is taking longer than expected. Check the error above.", flush=True)
+                server.should_exit = True
 
-        ready = threading.Thread(target=open_when_ready, daemon=True)
-        ready.start()
-        try:
-            server.run(sockets=[listener])
-        finally:
-            stop_waiting.set()
-            ready.join(timeout=3)
+            ready = threading.Thread(target=open_when_ready, daemon=True)
+            ready.start()
+            try:
+                server.run(sockets=[listener])
+            finally:
+                stop_waiting.set()
+                ready.join(timeout=3)
+                state_file.unlink(missing_ok=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Install and open the ZanDop local demo.")
+    parser.add_argument("--workspace", action="store_true", help="Open the real local workspace; Gmail automation starts paused.")
     parser.add_argument("--no-browser", action="store_true", help="Start without opening a browser.")
     parser.add_argument("--data-dir", type=Path, help="Optional separate demo data folder.")
     parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
@@ -134,13 +197,16 @@ def main():
     if sys.version_info[:2] != (3, 12):
         raise RuntimeError("Install Python 3.12, then launch ZanDop again.")
     if args.serve:
-        serve(not args.no_browser)
+        serve(not args.no_browser, args.workspace)
         return
     python, browser = install()
     command = [str(python), str(Path(__file__).resolve()), "--serve"]
     if args.no_browser:
         command.append("--no-browser")
-    run(command, env=demo_environment(browser, args.data_dir))
+    if args.workspace:
+        command.append("--workspace")
+    environment = workspace_environment(browser, args.data_dir) if args.workspace else demo_environment(browser, args.data_dir)
+    run(command, env=environment)
 
 
 if __name__ == "__main__":

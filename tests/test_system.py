@@ -119,7 +119,7 @@ class AgencyTest(unittest.TestCase):
     def test_approval_cannot_be_replayed_or_mutated(self):
         lead = self.lead()
         with connect() as db:
-            gate = engine.approval(db, lead, "invoice", "Issue invoice", {"amount": 10000, "currency": "usd", "description": "Approved scope"})
+            gate = engine.approval(db, lead, "invoice", "Issue invoice", {"amount": 50000, "currency": "usd", "description": "Approved scope", "body": "Approved payment request"})
         engine.decide(gate["id"], "approve", "human")
         with self.assertRaises(Blocked):
             engine.decide(gate["id"], "approve", "human")
@@ -138,7 +138,8 @@ class AgencyTest(unittest.TestCase):
             engine.queue(db, lead, "invoice", {"amount": 100, "currency": "usd"})
         engine.drain_outbox()
         with connect() as db:
-            self.assertEqual(db.execute("SELECT status FROM outbox").fetchone()[0], "blocked")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT status FROM approvals").fetchone()[0], "pending")
 
     def test_wrong_payment_and_demo_live_crossing_are_rejected(self):
         lead = self.lead()
@@ -154,7 +155,7 @@ class AgencyTest(unittest.TestCase):
     def test_failed_quality_checks_prevent_release(self):
         lead = self.lead()
         with connect() as db:
-            gate = engine.approval(db, lead, "final_delivery", "Release", {"checks": [{"status": "failed", "check": "Broken link"}]})
+            gate = engine.approval(db, lead, "final_delivery", "Release", {"body": "Ready to deliver", "checks": [{"status": "failed", "check": "Broken link"}]})
         with self.assertRaises(Blocked):
             engine.decide(gate["id"], "approve", "human")
 
@@ -244,16 +245,17 @@ class AgencyTest(unittest.TestCase):
     def test_uncertain_invoice_reconciliation_preserves_amount(self):
         lead = self.lead(False)
         with connect() as db:
-            gate = engine.approval(db, lead, "invoice", "Approved invoice", {"amount": 25000, "currency": "usd", "description": "Fixed scope"})
+            gate = engine.approval(db, lead, "invoice", "Approved invoice", {"amount": 55000, "currency": "usd", "description": "Fixed scope", "body": "Approved payment request"})
         engine.decide(gate["id"], "approve", "human")
         with connect() as db:
             db.execute("UPDATE outbox SET status='uncertain' WHERE lead_id=?", (lead["id"],))
+            action_id = db.execute("SELECT id FROM outbox WHERE lead_id=?", (lead["id"],)).fetchone()[0]
         with self.assertRaises(Blocked):
-            engine.reconcile_action(lead["id"] + ":invoice", "sent", "Checked provider dashboard")
-        engine.reconcile_action(lead["id"] + ":invoice", "sent", "Matched exact invoice in provider dashboard", "inv_confirmed")
+            engine.reconcile_action(action_id, "sent", "Checked provider dashboard")
+        engine.reconcile_action(action_id, "sent", "Matched exact invoice in provider dashboard", "inv_confirmed")
         invoice = self.read_lead(lead["id"])["details"]["invoice"]
         self.assertEqual(invoice["id"], "inv_confirmed")
-        self.assertEqual(invoice["amount"], 25000)
+        self.assertEqual(invoice["amount"], 55000)
         self.assertEqual(self.get_gate(lead["id"], "invoice")["status"], "executed")
 
     def test_api_operator_auth_and_webhook_signature(self):
@@ -267,7 +269,7 @@ class AgencyTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(client.post("/webhooks/relay", content=payload, headers={"x-zandop-signature": sig}).json()["status"], "duplicate")
 
-    def test_stripe_signature_rejects_stale_and_tampered_events(self):
+    def test_timestamped_signature_rejects_stale_and_tampered_events(self):
         body, secret = b'{"id":"evt"}', "secret"
         timestamp = str(int(time.time()))
         digest = hmac.new(secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256).hexdigest()

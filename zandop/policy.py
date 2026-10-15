@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timezone
 
 
@@ -7,7 +8,44 @@ class Blocked(Exception):
 
 
 def live_enabled():
+    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+        from .db import connect, setting
+        with connect() as db:
+            return bool(setting(db, "automation_enabled", False))
     return os.environ.get("ZANDOP_LIVE_MODE", "false").lower() == "true"
+
+
+MINIMUM_PACKAGE = 50000  # USD cents; no floating point money.
+
+
+def sensitive_text(text):
+    """Conservative document routing, in addition to explicit financial action gates."""
+    return bool(re.search(r"[$€£]|\b(?:usd|eur|gbp|pkr|dollars?|invoice|payments?|payoneer|stripe|refunds?|discounts?|deposits?|prices?|pricing|fees?|costs?|budgets?|contracts?|agreements?|signatures?|liability|guarantee|legal)\b", str(text), re.I))
+
+
+def needs_approval(db, kind, payload):
+    if kind in {"proposal", "invoice", "final_delivery", "financial_reply", "legal_document", "custom_reply"}:
+        return True
+    if any(key in payload for key in ("amount", "payment_url", "price", "fee")):
+        return True
+    if sensitive_text(payload.get("subject", "") + " " + payload.get("body", "")):
+        return True
+    if payload.get("attachment"):
+        row = db.execute("SELECT p.requires_approval FROM documents d LEFT JOIN document_policy p ON p.document_id=d.id WHERE d.path=?", (payload["attachment"],)).fetchone()
+        # Older/unclassified attachments also need a human review.
+        return not row or row[0] is None or bool(row[0])
+    return False
+
+
+def client_rate(lead):
+    quote = lead["details"].get("quote")
+    if not quote and lead["demo"]:
+        quote = rate_for(lead["service"], True)
+    if not quote:
+        raise Blocked("Review the client's requirements and set a manual quote of at least $500 USD.")
+    if type(quote.get("amount")) is not int or quote["amount"] < MINIMUM_PACKAGE or quote.get("currency") != "usd" or not quote.get("scope"):
+        raise Blocked("Every package requires a manual scope and a price of at least $500 USD.")
+    return quote
 
 
 def require_live():

@@ -1,4 +1,5 @@
 import textwrap
+import hashlib
 from pathlib import Path
 
 from reportlab.lib.colors import HexColor, Color
@@ -129,7 +130,7 @@ def create_document(db, lead, kind):
         book.text("02 / THE ROAD AHEAD", 44, 718, 10, color=PURPLE, bold=True)
         book.text("Four milestones.\nOne clear direction." if kind == "plan" else "Less guesswork.\nMore forward motion.", 44, 670, 32, bold=True, leading=39)
         milestones = [
-            ("01", "Discover & align", "Confirm goals, audience, existing assets, and success measures. Your video call shapes the brief."),
+            ("01", "Discover & align", "Confirm goals, audience, existing assets, and success measures. Your questionnaire or discovery call shapes the brief."),
             ("02", "Shape the direction", "Build a focused project plan with pages, features, content needs, and agreed milestones."),
             ("03", "Make & refine", {"ecommerce": "Map the catalog, scaffold the storefront, and refine product and collection experiences.", "website": "Build the selected WordPress, React, custom website, or React Native screens from the agreed specification.", "content": "Develop the editorial outline, write to your brand voice, and check target keywords and factual claims."}[lead["service"]]),
             ("04", "Check & hand over", "Review links, responsive layouts, copy, and performance. Final human approval comes before client delivery or publication.")]
@@ -142,12 +143,16 @@ def create_document(db, lead, kind):
         book.text("A strong start\nis a shared effort.", 44, 670, 32, bold=True, leading=39)
         needed = {"ecommerce": "Product CSV, collection structure, brand assets, photography, shipping preferences, and access via collaborator invitations.", "website": "Page list, brand assets, approved copy, examples you like, and a clear list of required features. Use collaborator invitations for access.", "content": "Brand voice examples, audience personas, target keywords, factual source material, and an editorial priority list."}[lead["service"]]
         y = book.section("01", "What to bring", needed, 535)
-        y = book.section("02", "Your project notes", str(lead["details"].get("call_notes") or "We will capture decisions after the discovery call and turn them into the next version of your project plan.")[:750], y)
+        y = book.section("02", "Your project notes", str(lead["details"].get("call_notes") or lead["details"].get("requirements") or "We will capture decisions after discovery and turn them into the next version of your project plan.")[:750], y)
         y = book.section("03", "How we stay in sync", "Weekly progress updates cover completed work, upcoming milestones, and any decisions we need from you. One shared project history keeps the work traceable.", y)
         book.text("NEXT STEP", 44, max(110, y), 10, color=PURPLE, bold=True)
         book.text("Review the direction with your ZanDop contact.", 44, max(86, y - 23), 13, bold=True)
         book.end()
     book.save()
     db.execute("INSERT INTO documents VALUES(?,?,?,?,?,?,?)", (document_id, lead["id"], kind, version, title, relative, now()))
+    from .policy import sensitive_text
+    inputs = " ".join(str(lead["details"].get(key, "")) for key in ("goals", "call_notes", "brand_voice", "requirements"))
+    inputs += " " + lead["name"] + " " + lead["industry"] + " " + lead["platform"] + " " + str(research.get("flaw", ""))
+    db.execute("INSERT INTO document_policy VALUES(?,?,?)", (document_id, hashlib.sha256(path.read_bytes()).hexdigest(), int(kind == "proposal" or sensitive_text(inputs))))
     event(db, lead["id"], "Researcher" if kind == "brief" else "Client Success", "document.created", f"{kind} PDF version {version}")
     return {"id": document_id, "path": relative, "title": title, "kind": kind, "version": version}

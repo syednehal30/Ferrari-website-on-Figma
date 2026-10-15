@@ -14,12 +14,13 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
-from . import engine, integrations
-from .db import add_lead, connect, data_dir, event, initialize, now, save_lead, setting, uid, unpack
+from . import engine, integrations, finance, conversations, mailbox
+from .db import add_lead, connect, data_dir, event, initialize, now, save_lead, set_setting, setting, uid, unpack
 from .policy import Blocked, live_enabled
 
 
 class LeadDetails(BaseModel):
+    client_contact: bool = False
     revenue_score: int = Field(default=0, ge=0, le=25)
     traffic_score: int = Field(default=0, ge=0, le=25)
     visual_score: int = Field(default=0, ge=0, le=30)
@@ -73,9 +74,47 @@ class Reconcile(BaseModel):
     provider_id: str | None = Field(default=None, max_length=200)
 
 
+class QuoteEdit(BaseModel):
+    amount: int = Field(ge=50000, le=100000000, strict=True)
+    scope: str = Field(min_length=20, max_length=1200)
+
+
+class PayoneerLink(BaseModel):
+    url: str = Field(min_length=20, max_length=2000)
+
+
+class PaymentConfirmation(BaseModel):
+    amount: int = Field(ge=50000, strict=True)
+    reference: str = Field(min_length=4, max_length=150)
+    confirmed: bool
+
+
+class GmailConfig(BaseModel):
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(default="", max_length=100)
+    label: str = Field(default="ZanDop", min_length=1, max_length=100)
+
+
+class Toggle(BaseModel):
+    enabled: bool
+
+
+class ClientMessage(BaseModel):
+    subject: str = Field(min_length=1, max_length=200, pattern=r"^[^\r\n]+$")
+    body: str = Field(min_length=2, max_length=10000)
+
+
+class QuestionnaireSend(BaseModel):
+    client_expects_contact: bool
+
+
+class ModelSetting(BaseModel):
+    model: str = Field(default="", max_length=120, pattern=r"^[a-zA-Z0-9_:./-]*$")
+
+
 async def worker():
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
         if live_enabled():
             try:
                 await asyncio.to_thread(engine.discover_configured_sources)
@@ -85,11 +124,23 @@ async def worker():
                     event(db, None, "Orchestrator", "worker.error", type(exc).__name__)
 
 
+async def mail_worker():
+    while True:
+        await asyncio.sleep(60)
+        if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true" and live_enabled():
+            try:
+                await asyncio.to_thread(mailbox.poll)
+                await asyncio.to_thread(engine.drain_outbox)
+            except Exception as exc:
+                with connect() as db:
+                    event(db, None, "Client Success", "mail.worker_error", type(exc).__name__)
+
+
 @asynccontextmanager
 async def lifespan(app):
+    initialize()
     if live_enabled() and len(os.environ.get("ZANDOP_OPERATOR_TOKEN", "")) < 32:
         raise RuntimeError("Live mode requires a ZANDOP_OPERATOR_TOKEN of at least 32 characters.")
-    initialize()
     if os.environ.get("ZANDOP_SEED_DEMO", "true").lower() == "true":
         await asyncio.to_thread(engine.seed_demo)
     # A process interruption may leave an ambiguous external action. Never replay it automatically.
@@ -99,15 +150,21 @@ async def lifespan(app):
         for row in stranded:
             event(db, row["lead_id"], "CRM", "action.uncertain", row["kind"] + " interrupted")
     task = asyncio.create_task(worker())
+    mail_task = asyncio.create_task(mail_worker())
     yield
     task.cancel()
+    mail_task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
+    try:
+        await mail_task
+    except asyncio.CancelledError:
+        pass
 
 
-app = FastAPI(title="ZanDop Agency OS", version="0.1.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="ZanDop Agency OS", version="0.2.0", lifespan=lifespan, docs_url=None, redoc_url=None)
 
 
 @app.middleware("http")
@@ -151,7 +208,26 @@ async def duplicate_error(request, exc):
 def health():
     with connect() as db:
         db.execute("SELECT 1")
-    return {"status": "ok", "mode": "live" if live_enabled() else "demo", "authentication_required": bool(os.environ.get("ZANDOP_OPERATOR_TOKEN"))}
+    return {"status": "ok", "mode": workspace_mode(), "authentication_required": bool(os.environ.get("ZANDOP_OPERATOR_TOKEN"))}
+
+
+def workspace_mode():
+    return "live" if live_enabled() else "paused" if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true" else "demo"
+
+
+@app.get("/local/session")
+def local_session(request: Request, code: str):
+    current = os.environ.get("ZANDOP_OPERATOR_TOKEN", "")
+    if current and hmac.compare_digest(request.cookies.get("zandop_session", ""), current):
+        return RedirectResponse("/", status_code=303)
+    expected = os.environ.get("ZANDOP_LOCAL_BOOTSTRAP", "")
+    if not expected or not hmac.compare_digest(code, expected):
+        raise HTTPException(401, "Reopen the workspace using its Windows launcher.")
+    os.environ.pop("ZANDOP_LOCAL_BOOTSTRAP", None)
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie("zandop_session", os.environ["ZANDOP_OPERATOR_TOKEN"], httponly=True, samesite="strict")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.post("/api/session")
@@ -162,11 +238,23 @@ def session():
 
 
 def provider_status():
+    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+        status = mailbox.public_status()
+        with connect() as db:
+            model = setting(db, "ollama_model", "")
+        return [
+            {"id": "gmail", "name": "Client email", "provider": "Gmail IMAP + SMTP", "configured": status["verified"], "requirements": [{"name": "Gmail connection tested", "present": status["verified"]}]},
+            {"id": "payoneer", "name": "Payoneer", "provider": "Manual request link + explicit send approval + owner payment verification", "configured": True, "requirements": []},
+            {"id": "pricing", "name": "Client pricing", "provider": "Manual quotes · minimum $500 USD", "configured": True, "requirements": []},
+            {"id": "conversation", "name": "Routine conversations", "provider": "Local rule-based assistant · no AI subscription", "configured": True, "requirements": []},
+            {"id": "model", "name": "Content drafting", "provider": "Optional local Ollama model", "configured": bool(model), "requirements": [{"name": "Local model name", "present": bool(model)}]},
+            {"id": "outreach", "name": "Cold outreach", "provider": "Separate warmed domain via Instantly or Smartlead; optional paid services", "configured": False, "requirements": []},
+        ]
     provider = os.environ.get("OUTREACH_PROVIDER", "instantly")
     definitions = [
         ("outreach", "Cold outreach", "Instantly / Smartlead", ["INSTANTLY_API_KEY" if provider == "instantly" else "SMARTLEAD_API_KEY", "OUTREACH_SENDER", "OUTREACH_DOMAIN", "OUTREACH_WARMED_AT", "OUTREACH_CAMPAIGN_ID", "AGENCY_PRIMARY_DOMAIN", "PERSONAL_EMAIL_DOMAINS", "AUTOMATION_WEBHOOK_SECRET"]),
         ("calendar", "Call scheduling", "Cal.com / Calendly", ["BOOKING_URL", "CALCOM_WEBHOOK_SECRET" if os.environ.get("CALENDAR_PROVIDER", "calcom") == "calcom" else "CALENDLY_WEBHOOK_SECRET"]),
-        ("stripe", "Invoices & payment events", "Stripe", ["STRIPE_API_KEY", "STRIPE_WEBHOOK_SECRET"]),
+        ("payoneer", "Payoneer payment requests", "Owner-created link; approval before sending; owner verifies receipt", []),
         ("email", "Client correspondence", "Resend", ["RESEND_API_KEY", "CLIENT_EMAIL_FROM", "AGENCY_PRIMARY_DOMAIN"]),
         ("places", "Business discovery", "Google Places", ["GOOGLE_PLACES_API_KEY"]),
         ("model", "Content generation", "OpenAI-compatible API", ["MODEL_BASE_URL", "MODEL_API_KEY", "MODEL_NAME"]),
@@ -184,13 +272,120 @@ def state():
         events = [dict(row) for row in db.execute("SELECT e.*,l.name AS client FROM events e LEFT JOIN leads l ON e.lead_id=l.id ORDER BY e.created_at DESC LIMIT 100")]
         actions = [unpack(row) for row in db.execute("SELECT id,lead_id,kind,status,result,created_at FROM outbox WHERE status IN ('pending','blocked','uncertain') ORDER BY created_at DESC")]
         return {"leads": leads, "approvals": approvals, "documents": documents, "events": events, "stages": engine.STAGES,
-                "providers": provider_status(), "outbox": actions, "mode": "live" if live_enabled() else "demo", "outreach_health": setting(db, "outreach_health", {}), "updated_at": now()}
+                "providers": provider_status(), "outbox": actions, "mode": workspace_mode(), "outreach_health": setting(db, "outreach_health", {}), "updated_at": now(),
+                "mailbox": mailbox.public_status(), "ollama_model": setting(db, "ollama_model", ""), "minimum_package": 50000}
 
 
 @app.post("/api/leads", status_code=201)
 def create_lead(body: LeadCreate):
     with connect() as db:
-        return add_lead(db, body.model_dump())
+        lead = add_lead(db, body.model_dump())
+        if body.details.client_contact:
+            lead["stage"] = 4
+            save_lead(db, lead)
+            conversations.request_questionnaire(db, lead)
+            save_lead(db, lead)
+        return lead
+
+
+@app.post("/api/leads/{lead_id}/quote")
+def edit_quote(lead_id: str, body: QuoteEdit):
+    return finance.set_quote(lead_id, body.amount, body.scope)
+
+
+@app.post("/api/leads/{lead_id}/payoneer")
+def payment_link(lead_id: str, body: PayoneerLink):
+    return finance.set_payment_link(lead_id, body.url)
+
+
+@app.post("/api/leads/{lead_id}/confirm-payment")
+def payment_received(lead_id: str, body: PaymentConfirmation):
+    return finance.confirm_payment(lead_id, body.amount, body.reference, body.confirmed)
+
+
+@app.post("/api/leads/{lead_id}/questionnaire")
+def send_questionnaire(lead_id: str, body: QuestionnaireSend):
+    if not body.client_expects_contact:
+        raise Blocked("Confirm that the client expects this questionnaire. Gmail is not a cold outreach sender.")
+    with engine.LOCK, connect() as db:
+        lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+        if not lead:
+            raise KeyError(lead_id)
+        lead["details"]["client_contact"] = True
+        if lead["stage"] < 4:
+            lead["stage"] = 4
+        result = conversations.request_questionnaire(db, lead)
+        save_lead(db, lead)
+    engine.drain_outbox()
+    return result
+
+
+@app.post("/api/leads/{lead_id}/conversation-pause")
+def pause_conversation(lead_id: str, body: Toggle):
+    with engine.LOCK, connect() as db:
+        lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+        if not lead:
+            raise KeyError(lead_id)
+        lead["details"]["conversation_paused"] = body.enabled
+        save_lead(db, lead)
+        event(db, lead_id, "Human", "conversation.paused" if body.enabled else "conversation.resumed", "Client-specific reply control changed")
+    return {"status": "saved"}
+
+
+@app.post("/api/leads/{lead_id}/reply")
+def compose_reply(lead_id: str, body: ClientMessage):
+    with engine.LOCK, connect() as db:
+        lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+        if not lead:
+            raise KeyError(lead_id)
+        # Operator-authored financial messages still require the separate explicit approval.
+        result = engine.queue(db, lead, "custom_reply", body.model_dump(), unique=uid("reply_"))
+        event(db, lead_id, "Human", "reply.composed", "Reply prepared; financial or legal content requires approval")
+    engine.drain_outbox()
+    return result
+
+
+@app.post("/api/leads/{lead_id}/simulate-message")
+def simulate_message(lead_id: str, body: ClientMessage):
+    with engine.LOCK, connect() as db:
+        lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+        if not lead or not lead["demo"]:
+            raise Blocked("Only fictional demo clients accept simulated messages.")
+        result = conversations.receive(db, {**body.model_dump(), "email": lead["email"], "name": lead["name"], "message_id": uid("demo_message_")}, "demo", lead)
+    engine.drain_outbox()
+    return result
+
+
+@app.post("/api/local/gmail")
+def configure_gmail(body: GmailConfig):
+    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") != "true":
+        raise Blocked("Use the real local workspace launcher to connect Gmail.")
+    return mailbox.configure(body.email, body.password, body.label)
+
+
+@app.post("/api/local/gmail/test")
+def test_gmail():
+    return mailbox.test_connection()
+
+
+@app.post("/api/local/automation")
+def automation(body: Toggle):
+    return mailbox.set_enabled(body.enabled)
+
+
+@app.post("/api/local/poll")
+def check_mail():
+    result = mailbox.poll()
+    engine.drain_outbox()
+    return result
+
+
+@app.post("/api/local/model")
+def local_model(body: ModelSetting):
+    with connect() as db:
+        set_setting(db, "ollama_model", body.model)
+        event(db, None, "Human", "model.configured", "Local Ollama model selection updated")
+    return {"status": "saved"}
 
 
 @app.post("/api/leads/import")
@@ -239,6 +434,27 @@ def notes(lead_id: str, body: CallNotes):
 def book(lead_id: str, body: Booking):
     if not body.client_confirmed:
         raise Blocked("The client must confirm the time and timezone before a call is booked.")
+    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+        from datetime import datetime
+        try:
+            start = datetime.fromisoformat(body.start.replace("Z", "+00:00"))
+            if start.tzinfo is None:
+                raise ValueError()
+        except ValueError:
+            raise Blocked("Enter a valid call time including its UTC offset.") from None
+        with engine.LOCK, connect() as db:
+            lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
+            if not lead:
+                raise KeyError(lead_id)
+            lead["details"]["call_booked"] = {"start": start.isoformat(), "timezone": body.timezone, "provider": "owner-confirmed"}
+            lead["details"]["client_contact"] = True
+            if lead["stage"] < 4:
+                lead["stage"] = 4
+            engine.welcome(db, lead)
+            save_lead(db, lead)
+            event(db, lead_id, "Human", "call.confirmed", "Confirmed slot recorded; owner adds calendar event and hosts the video call")
+        engine.drain_outbox()
+        return {"status": "recorded", "calendar_event_created": False}
     with connect() as db:
         lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
         if not lead:
@@ -322,7 +538,7 @@ async def webhook(provider: str, request: Request):
     raw = await request.body()
     if len(raw) > 1_000_000:
         raise HTTPException(413, "Request too large")
-    secrets = {"relay": ("AUTOMATION_WEBHOOK_SECRET", "x-zandop-signature", False), "stripe": ("STRIPE_WEBHOOK_SECRET", "stripe-signature", True), "calcom": ("CALCOM_WEBHOOK_SECRET", "x-cal-signature-256", False), "calendly": ("CALENDLY_WEBHOOK_SECRET", "calendly-webhook-signature", True)}
+    secrets = {"relay": ("AUTOMATION_WEBHOOK_SECRET", "x-zandop-signature", False), "calcom": ("CALCOM_WEBHOOK_SECRET", "x-cal-signature-256", False), "calendly": ("CALENDLY_WEBHOOK_SECRET", "calendly-webhook-signature", True)}
     if provider not in secrets:
         raise HTTPException(404, "Unknown webhook provider")
     key, header, timestamped = secrets[provider]
@@ -330,12 +546,7 @@ async def webhook(provider: str, request: Request):
         raise HTTPException(401, "Invalid webhook signature")
     try:
         payload = json.loads(raw)
-        if provider == "stripe":
-            if payload["type"] != "invoice.paid":
-                return {"status": "ignored"}
-            invoice = payload["data"]["object"]
-            payload = {"id": payload["id"], "type": "invoice.paid", "lead_id": invoice["metadata"]["zandop_lead"], "data": {"invoice_id": invoice["id"], "amount_paid": invoice["amount_paid"], "currency": invoice["currency"]}}
-        elif provider == "calcom":
+        if provider == "calcom":
             if payload["triggerEvent"] != "BOOKING_CREATED":
                 return {"status": "ignored"}
             booking = payload["payload"]

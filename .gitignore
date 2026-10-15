@@ -1,6 +1,7 @@
 .venv/
 .venv-local/
 .local-demo/
+.local-workspace/
 .env
 __pycache__/
 *.pyc

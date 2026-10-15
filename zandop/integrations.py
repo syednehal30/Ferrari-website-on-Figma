@@ -118,6 +118,9 @@ def pause_campaign():
 
 def send_transactional(lead, payload, key):
     require_live()
+    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+        from .mailbox import send
+        return send(lead, payload, key)
     sender = required("CLIENT_EMAIL_FROM")
     if sender.split("@")[-1].strip("> ").lower() != required("AGENCY_PRIMARY_DOMAIN").lower():
         raise Blocked("Client correspondence must use the configured agency domain.")
@@ -134,16 +137,10 @@ def send_transactional(lead, payload, key):
 
 def issue_invoice(lead, payload, key):
     require_live()
-    auth = (required("STRIPE_API_KEY"), "")
-    root = "https://api.stripe.com/v1"
-    customer = api("POST", root + "/customers", auth=auth, headers={"Idempotency-Key": key + "-customer"}, data={"email": lead["email"], "name": lead["name"], "metadata[zandop_lead]": lead["id"]})
-    invoice = api("POST", root + "/invoices", auth=auth, headers={"Idempotency-Key": key + "-invoice"},
-                  data={"customer": customer["id"], "collection_method": "send_invoice", "days_until_due": "14", "auto_advance": "false", "metadata[zandop_lead]": lead["id"]})
-    api("POST", root + "/invoiceitems", auth=auth, headers={"Idempotency-Key": key + "-item"},
-        data={"customer": customer["id"], "invoice": invoice["id"], "amount": str(payload["amount"]), "currency": payload["currency"], "description": payload["description"]})
-    api("POST", root + f"/invoices/{invoice['id']}/finalize", auth=auth, headers={"Idempotency-Key": key + "-finalize"}, data={"auto_advance": "false"})
-    result = api("POST", root + f"/invoices/{invoice['id']}/send", auth=auth, headers={"Idempotency-Key": key + "-send"})
-    return {"id": result["id"], "status": result["status"], "amount_due": result["amount_due"], "currency": result["currency"]}
+    from .finance import payoneer_url
+    payoneer_url(payload["payment_url"])
+    result = send_transactional(lead, payload, key)
+    return {"id": result["id"], "provider": "payoneer", "status": "request_sent", "payment_url": payload["payment_url"]}
 
 
 def book_call(lead, payload, key):
@@ -164,6 +161,19 @@ def discover_places(query):
 
 def generate_json(system, prompt):
     require_live()
+    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+        from .db import connect, setting
+        with connect() as db:
+            model = setting(db, "ollama_model", "")
+        if not model:
+            raise Blocked("For content drafting, install Ollama locally, download a model, and enter its name in Local setup. No paid AI API is required.")
+        try:
+            response = httpx.post("http://127.0.0.1:11434/api/chat", timeout=120, trust_env=False,
+                json={"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], "format": "json", "stream": False})
+            response.raise_for_status()
+            return json.loads(response.json()["message"]["content"])
+        except (httpx.HTTPError, KeyError, ValueError):
+            raise Blocked("The local Ollama model could not produce a valid draft. Check that Ollama and your selected model are running.") from None
     base = required("MODEL_BASE_URL").rstrip("/")
     if not base.startswith("https://"):
         raise Blocked("The model gateway must use HTTPS.")
