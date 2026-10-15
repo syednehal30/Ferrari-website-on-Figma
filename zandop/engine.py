@@ -15,7 +15,7 @@ LOCK = threading.RLock()
 STAGES = [
     {"id": 1, "name": "Lead Finder", "short": "Discover", "description": "Source businesses and score the opportunity using explicit evidence.", "icon": "radar"},
     {"id": 2, "name": "Researcher", "short": "Research", "description": "Inspect the website, platform, catalog, performance and competitors. Produce a one-page brief.", "icon": "search"},
-    {"id": 3, "name": "Outreach", "short": "Reach out", "description": "Enroll evidence-based messages through a warmed secondary domain. Pause on elevated bounces.", "icon": "send"},
+    {"id": 3, "name": "Outreach", "short": "Reach out", "description": "Write an individual first email with a local model. Send through personal Gmail within daily limits after prospect review.", "icon": "send"},
     {"id": 4, "name": "Sales", "short": "Qualify", "description": "Send questionnaires, manage client replies, and request an owner-edited quote starting at $500 USD.", "icon": "chat"},
     {"id": 5, "name": "CRM", "short": "Remember", "description": "Consolidate the handoff. Every agent also writes to this audit trail throughout the journey.", "icon": "database"},
     {"id": 6, "name": "Client Success", "short": "Welcome", "description": "Send a welcome PDF on booking and a project plan after call notes arrive.", "icon": "spark"},
@@ -115,7 +115,11 @@ def advance(lead_id):
                     if not lead["demo"]:
                         outreach_policy(db, lead)
                     message = {"subject": f"A small idea for {lead['name']}", "body": f"Hi {lead['name']} team,\n\n{flaw}\n\nWe help {lead['industry'] or 'business'} teams improve their {lead['service']} experience. Worth a quick conversation about a focused fix?\n\nZanDop\nIf this is not relevant, reply 'no thanks' and we will not follow up."}
-                    row = queue(db, lead, "cold_email", message)
+                    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true" and not lead["demo"]:
+                        message = d["outreach_draft"]
+                        row = queue(db, lead, "cold_email", message, unique=f"{lead['id']}:cold_email:{d['outreach_review_hash']}")
+                    else:
+                        row = queue(db, lead, "cold_email", message)
                     if row["status"] in {"done", "simulated"}:
                         lead["stage"], lead["status"] = 4, "awaiting_reply"
                     else:
@@ -131,7 +135,12 @@ def advance(lead_id):
                         lead["status"] = "rejected"
                     elif proposal["status"] == "executed":
                         if (lead["demo"] and not d.get("quote")) or d.get("quote_accepted", {}).get("reference") == rate.get("reference") and rate.get("reference"):
-                            lead["stage"], lead["status"] = 5, "ready"
+                            from .growth import reserve_start
+                            if reserve_start(db, lead):
+                                welcome(db, lead)
+                                lead["stage"], lead["status"] = 5, "ready"
+                            else:
+                                lead["status"] = "awaiting_capacity"
                         else:
                             lead["status"] = "awaiting_acceptance"
                     else:
@@ -273,6 +282,12 @@ def drain_outbox():
                             preflight(lead)
                         if row["kind"] in {"cold_email", "sales_reply"}:
                             outreach_policy(db, lead)
+                        if row["kind"] == "cold_email" and os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+                            from .mailbox import preflight
+                            preflight(lead, outreach=True)
+                            draft = lead["details"].get("outreach_draft", {})
+                            if any(row["payload"].get(key) != draft.get(key) for key in ("subject", "body")):
+                                raise Blocked("The queued first email differs from the reviewed draft.")
                 except Blocked as exc:
                     # This is a known preflight failure, so no provider request was attempted.
                     db.execute("UPDATE outbox SET result=? WHERE id=?", (str(exc), row["id"]))
@@ -280,6 +295,8 @@ def drain_outbox():
                 claimed = db.execute("UPDATE outbox SET status='sending',attempts=attempts+1 WHERE id=? AND status='pending'", (row["id"],)).rowcount
                 if not claimed:
                     continue
+                if row["kind"] == "cold_email" and not lead["demo"] and os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+                    db.execute("INSERT INTO outreach_attempts VALUES(?,?,?,?,?)", (uid("attempt_"), row["id"], lead["id"], lead["email"], now()))
             try:
                 if lead["demo"]:
                     result, status = {"demo": True, "id": uid("demo_"), **({"provider": "payoneer"} if row["kind"] == "invoice" else {})}, "simulated"
@@ -291,6 +308,12 @@ def drain_outbox():
                     db.execute("UPDATE outbox SET status=?,result=? WHERE id=?", (status, json.dumps(result), row["id"]))
                     if row["payload"].get("approval_id"):
                         db.execute("UPDATE approvals SET status='executed',result=? WHERE id=?", (json.dumps(result), row["payload"]["approval_id"]))
+                    if row["kind"] == "cold_email" and os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true" and not lead["demo"]:
+                        lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead["id"],)).fetchone())
+                        if lead["stage"] <= 3:
+                            lead["stage"], lead["status"] = 4, "awaiting_reply"
+                            lead["details"].pop("blocker", None)
+                            save_lead(db, lead)
                     if row["kind"] == "invoice":
                         lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead["id"],)).fetchone())
                         lead["details"]["invoice"] = {**result, "amount": row["payload"]["amount"], "currency": row["payload"]["currency"]}
@@ -308,6 +331,9 @@ def drain_outbox():
             except Exception as exc:
                 with connect() as db:
                     db.execute("UPDATE outbox SET status='uncertain',result=? WHERE id=?", (str(exc) if isinstance(exc, Blocked) else type(exc).__name__, row["id"]))
+                    if row["kind"] == "cold_email" and os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+                        set_setting(db, "gmail_outreach_paused", True)
+                        event(db, lead["id"], "Outreach", "gmail.paused", "A Gmail sending error occurred; inspect the message and account before resuming")
                     event(db, lead["id"], "CRM", "action.uncertain", f"{row['kind']} needs reconciliation; automatic retries disabled to avoid duplicate side effects")
 
 
@@ -325,6 +351,12 @@ def reconcile_action(action_id, outcome, evidence, provider_id=None):
                 raise Blocked("A provider receipt or invoice ID is required to confirm an action.")
             result = {"id": provider_id, "reconciled": True, **({"provider": "payoneer"} if row["kind"] == "invoice" else {})}
             db.execute("UPDATE outbox SET status='done',result=? WHERE id=?", (json.dumps(result), action_id))
+            if row["kind"] == "cold_email" and os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+                lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (row["lead_id"],)).fetchone())
+                if lead["stage"] <= 3:
+                    lead["stage"], lead["status"] = 4, "awaiting_reply"
+                    lead["details"].pop("blocker", None)
+                    save_lead(db, lead)
             if row["payload"].get("approval_id"):
                 db.execute("UPDATE approvals SET status='executed',result=? WHERE id=?", (json.dumps(result), row["payload"]["approval_id"]))
             if row["kind"] == "invoice":
@@ -470,6 +502,12 @@ def discover_configured_sources():
     from .discovery import discover_source
     sources = json.loads(os.environ.get("ZANDOP_SOURCES", "[]"))
     with LOCK, connect() as db:
+        local = os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true"
+        if local:
+            from .growth import periods, DAILY_TARGET
+            sources = setting(db, "free_lead_sources", [])
+            today = periods()[0]
+            found_today = db.execute("SELECT COUNT(*) FROM leads WHERE demo=0 AND created_at>=? AND json_extract(details,'$.outreach_candidate')=1", (today,)).fetchone()[0]
         last = setting(db, "discovery_last_run")
         if last and datetime.now(timezone.utc) - datetime.fromisoformat(last) < timedelta(hours=6):
             return
@@ -481,8 +519,14 @@ def discover_configured_sources():
                 added = 0
                 for record in records:
                     if not db.execute("SELECT 1 FROM leads WHERE email=? AND demo=0", (record["email"],)).fetchone():
+                        if local and found_today >= DAILY_TARGET:
+                            break
+                        if local:
+                            record["details"] = {"outreach_candidate": True, "contact_source": source["url"]}
                         add_lead(db, record)
                         added += 1
+                        if local:
+                            found_today += 1
                 event(db, None, "Lead Finder", "discovery.completed", f"{source['kind']}: {added} new businesses with published contact details")
             except Exception as exc:
                 event(db, None, "Lead Finder", "discovery.blocked", str(exc) if isinstance(exc, Blocked) else "Source could not be processed")

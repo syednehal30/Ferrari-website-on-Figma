@@ -47,9 +47,9 @@ def research(lead):
                 "mobile_viewport": None, "flaw": "No business website was listed in the supplied lead source.",
                 "evidence": "Source listing only; verify before making a claim about the business.", "competitors": [],
                 "competitor_status": "Competitor URLs needed", "traffic": "Unknown", "revenue": "Unknown", "visual_quality": "Not measured"}
-    started = time.monotonic()
     from .discovery import respect_robots
     respect_robots(lead["website"])
+    started = time.monotonic()
     html, url = fetch_public(lead["website"])
     elapsed = round(time.monotonic() - started, 2)
     parser = SiteParser()

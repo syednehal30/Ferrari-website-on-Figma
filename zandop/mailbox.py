@@ -80,6 +80,8 @@ def configure(address, password, label):
     with connect() as db:
         set_setting(db, "automation_enabled", False)
         set_setting(db, "gmail_verified", False)
+        set_setting(db, "gmail_outreach_enabled", False)
+        set_setting(db, "gmail_bounce_checked_at", "")
         event(db, None, "Human", "gmail.configured", "Client label configured; automation paused until connection test and activation")
     return public_status()
 
@@ -163,27 +165,32 @@ def set_enabled(enabled):
     return public_status()
 
 
-def preflight(lead):
+def preflight(lead, outreach=False):
     require_live()
     config = require_configuration()
     if not public_status()["verified"]:
         raise Blocked("Test the Gmail connection before sending client correspondence.")
-    if not (lead["details"].get("client_contact") or lead["details"].get("call_booked")):
-        raise Blocked("Gmail is only for existing client conversations or expected questionnaires, not cold outreach.")
+    if outreach:
+        from .growth import draft_hash
+        draft = lead["details"].get("outreach_draft", {})
+        if not draft or lead["details"].get("outreach_review_hash") != draft_hash(draft):
+            raise Blocked("Review this exact first email before sending from your Gmail.")
+    elif not (lead["details"].get("client_contact") or lead["details"].get("call_booked")):
+        raise Blocked("Use the reviewed outreach workflow for a first contact; this action is for client correspondence.")
     if lead["email"].lower() == config["email"].lower():
         raise Blocked("The client address must differ from the agency inbox.")
     return config
 
 
-def send(lead, payload, key):
-    config = preflight(lead)
+def send(lead, payload, key, outreach=False):
+    config = preflight(lead, outreach=outreach)
     msg = EmailMessage()
     msg["From"] = config["email"]
     msg["To"] = lead["email"]
     msg["Subject"] = payload["subject"]
     msg["Date"] = formatdate(localtime=False, usegmt=True)
     msg["Message-ID"] = "<" + hashlib.sha256((config["email"] + key).encode()).hexdigest() + "@zandop.local>"
-    msg["Auto-Submitted"] = "auto-replied"
+    msg["Auto-Submitted"] = "auto-generated" if outreach else "auto-replied"
     thread = payload.get("in_reply_to") or lead["details"].get("last_message_id")
     if thread and "\n" not in thread and "\r" not in thread and len(thread) < 500:
         msg["In-Reply-To"] = thread
@@ -237,6 +244,113 @@ def parse_message(raw, own_address):
             "body": "\n".join(lines).strip()[:10000], "message_id": str(message.get("Message-ID", ""))[:500] or hashlib.sha256(raw).hexdigest()}
 
 
+def record_bounce(db, raw):
+    message = email.message_from_bytes(raw, policy=policy.default)
+    bounce_id = "gmail-bounce:" + str(message.get("Message-ID", hashlib.sha256(raw).hexdigest()))
+    if db.execute("SELECT 1 FROM webhooks WHERE id=?", (bounce_id,)).fetchone():
+        return False
+    addresses = []
+    for part in message.walk():
+        if part.get_content_type() == "message/delivery-status":
+            for report in part.get_payload() if isinstance(part.get_payload(), list) else []:
+                if str(report.get("Action", "")).lower() == "failed" or str(report.get("Status", "")).startswith("5."):
+                    recipient = str(report.get("Final-Recipient", report.get("Original-Recipient", ""))).split(";")[-1].strip().lower()
+                    if recipient:
+                        addresses.append(recipient)
+    matched = False
+    for address in addresses:
+        row = db.execute("SELECT lead_id FROM outreach_attempts WHERE email=? ORDER BY created_at DESC LIMIT 1", (address,)).fetchone()
+        if row:
+            db.execute("INSERT OR IGNORE INTO suppressions VALUES(?,?,?)", (address, "Permanent Gmail delivery failure", now()))
+            db.execute("UPDATE leads SET status='suppressed',updated_at=? WHERE id=?", (now(), row[0]))
+            set_setting(db, "gmail_outreach_paused", True)
+            event(db, row[0], "Outreach", "gmail.bounced", "Permanent delivery failure; recipient suppressed and new outreach paused")
+            matched = True
+    if matched:
+        db.execute("INSERT INTO webhooks VALUES(?,?,?)", (bounce_id, "gmail-bounce", now()))
+    return matched
+
+
+def start_bounce_monitor():
+    config = require_configuration()
+    connection = imap_connection(config)
+    try:
+        status, _ = connection.select('"INBOX"', readonly=True)
+        if status != "OK":
+            raise Blocked("Gmail INBOX must be readable to monitor delivery failures.")
+        position = mailbox_position(connection)
+    finally:
+        connection.logout()
+    with connect() as db:
+        key = "gmail_bounce_cursor:" + account_key(config)
+        if not setting(db, key):
+            set_setting(db, key, position)
+            set_setting(db, "gmail_bounce_checked_at", now())
+            set_setting(db, "gmail_bounce_checked_account", account_key(config))
+
+
+def poll_bounces(config):
+    """Inspect new inbox headers, reading bodies only for bounces or known prospects."""
+    from . import conversations, engine
+    with connect() as db:
+        key = "gmail_bounce_cursor:" + account_key(config)
+        cursor = setting(db, key)
+        known = {row[0] for row in db.execute("SELECT DISTINCT email FROM outreach_attempts")}
+    if not cursor:
+        return
+    connection = imap_connection(config)
+    try:
+        status, _ = connection.select('"INBOX"', readonly=True)
+        if status != "OK":
+            raise Blocked("Gmail bounce monitoring is unavailable.")
+        current = mailbox_position(connection)
+        if current["validity"] != cursor["validity"]:
+            with connect() as db:
+                set_setting(db, "gmail_outreach_paused", True)
+                set_setting(db, key, current)
+            raise Blocked("The Gmail inbox identity changed; new outreach is paused for review.")
+        status, result = connection.uid("search", None, "UID", f"{cursor['last_uid']+1}:*")
+        if status != "OK":
+            raise Blocked("Gmail delivery-failure search failed.")
+        ids = sorted(int(v) for v in (result[0] or b"").split() if int(v) > cursor["last_uid"])[:100]
+        for identifier in ids:
+            status, headers = connection.uid("fetch", str(identifier), "(BODY.PEEK[HEADER.FIELDS (FROM CONTENT-TYPE)] RFC822.SIZE)")
+            raw_header = next((v[1] for v in headers if isinstance(v, tuple)), None)
+            if status != "OK" or raw_header is None:
+                raise Blocked("An inbox header could not be checked; new outreach will wait.")
+            header = email.message_from_bytes(raw_header, policy=policy.default)
+            sender = parseaddr(header.get("From", ""))[1].lower()
+            delivery_notice = "mailer-daemon" in sender or "postmaster" in sender or header.get_content_type() == "multipart/report"
+            raw = None
+            if delivery_notice or sender in known:
+                status, fetched = connection.uid("fetch", str(identifier), "(BODY.PEEK[]<0.1000001>)")
+                raw = next((v[1] for v in fetched if isinstance(v, tuple)), None)
+                if status != "OK" or raw is None:
+                    raise Blocked("A prospect reply or delivery failure could not be read; outreach will wait.")
+            with engine.LOCK, connect() as db:
+                if raw and len(raw) <= 1_000_000:
+                    record_bounce(db, raw)
+                    parsed = parse_message(raw, config["email"]) if sender in known and not delivery_notice else None
+                    if parsed:
+                        conversations.receive(db, parsed, "gmail:" + account_key(config))
+                elif raw:
+                    event(db, None, "CRM", "mail.needs_review", "Oversized prospect reply or delivery notice in Gmail INBOX; review manually")
+                    if delivery_notice:
+                        set_setting(db, "gmail_outreach_paused", True)
+                cursor["last_uid"] = identifier
+                set_setting(db, key, cursor)
+        with connect() as db:
+            if len(ids) < 100:
+                cursor["last_uid"] = max(cursor["last_uid"], current["last_uid"])
+                set_setting(db, key, cursor)
+                set_setting(db, "gmail_bounce_checked_at", now())
+                set_setting(db, "gmail_bounce_checked_account", account_key(config))
+            else:
+                set_setting(db, "gmail_bounce_checked_at", "")
+    finally:
+        connection.logout()
+
+
 def poll():
     if not live_enabled() or not POLL_LOCK.acquire(blocking=False):
         return {"processed": 0}
@@ -246,6 +360,7 @@ def poll():
         config = require_configuration()
         if not public_status()["verified"]:
             raise Blocked("Reconnect and test Gmail before polling.")
+        poll_bounces(config)
         connection = imap_connection(config)
         position = mailbox_position(connection)
         cursor_key = "gmail_cursor:" + account_key(config)
@@ -275,6 +390,8 @@ def poll():
                     raise Blocked("A Gmail message could not be read; it will remain pending for the next poll.")
                 parsed = parse_message(raw, config["email"])
             with engine.LOCK, connect() as db:
+                if int(size_match[1]) <= 1_000_000:
+                    record_bounce(db, raw)
                 if parsed:
                     conversations.receive(db, parsed, "gmail:" + account_key(config))
                     processed += 1

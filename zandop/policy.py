@@ -54,6 +54,10 @@ def require_live():
 
 
 def outreach_policy(db, lead):
+    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+        require_live()
+        from .growth import outreach_policy as local_policy
+        return local_policy(db, lead)
     from .db import setting
     require_live()
     sender = os.environ.get("OUTREACH_SENDER", "").lower().strip()

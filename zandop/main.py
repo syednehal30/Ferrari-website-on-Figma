@@ -14,13 +14,15 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
-from . import engine, integrations, finance, conversations, mailbox
+from . import engine, integrations, finance, conversations, mailbox, growth, free_leads
 from .db import add_lead, connect, data_dir, event, initialize, now, save_lead, set_setting, setting, uid, unpack
 from .policy import Blocked, live_enabled
 
 
 class LeadDetails(BaseModel):
     client_contact: bool = False
+    outreach_candidate: bool = False
+    contact_source: str = Field(default="", max_length=2000)
     revenue_score: int = Field(default=0, ge=0, le=25)
     traffic_score: int = Field(default=0, ge=0, le=25)
     visual_score: int = Field(default=0, ge=0, le=30)
@@ -112,6 +114,32 @@ class ModelSetting(BaseModel):
     model: str = Field(default="", max_length=120, pattern=r"^[a-zA-Z0-9_:./-]*$")
 
 
+class FreeSource(BaseModel):
+    kind: Literal["shopify_directory", "woocommerce_directory", "job_board", "linkedin"]
+    url: str = Field(min_length=10, max_length=2000, pattern=r"^https?://")
+    service: Literal["ecommerce", "website", "content"] = "website"
+
+
+class GrowthSettings(BaseModel):
+    market: str = Field(min_length=3, max_length=200)
+    daily_limit: int = Field(ge=1, le=12, strict=True)
+    sources: list[FreeSource] = Field(default_factory=list, max_length=10)
+
+
+class OutreachToggle(BaseModel):
+    enabled: bool
+    reviewed_bounces: bool = False
+
+
+class SiteIntake(BaseModel):
+    urls: list[str] = Field(min_length=1, max_length=12)
+    service: Literal["ecommerce", "website", "content"] = "website"
+
+
+class DraftReview(BaseModel):
+    draft_hash: str = Field(min_length=64, max_length=64)
+
+
 async def worker():
     while True:
         await asyncio.sleep(60)
@@ -119,6 +147,7 @@ async def worker():
             try:
                 await asyncio.to_thread(engine.discover_configured_sources)
                 await asyncio.to_thread(engine.cycle, False)
+                await asyncio.to_thread(growth.prepare_next)
             except Exception as exc:
                 with connect() as db:
                     event(db, None, "Orchestrator", "worker.error", type(exc).__name__)
@@ -164,7 +193,7 @@ async def lifespan(app):
         pass
 
 
-app = FastAPI(title="ZanDop Agency OS", version="0.2.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="ZanDop Agency OS", version="0.3.0", lifespan=lifespan, docs_url=None, redoc_url=None)
 
 
 @app.middleware("http")
@@ -238,7 +267,7 @@ def session():
 
 
 def provider_status():
-    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true" or not live_enabled():
         status = mailbox.public_status()
         with connect() as db:
             model = setting(db, "ollama_model", "")
@@ -247,8 +276,8 @@ def provider_status():
             {"id": "payoneer", "name": "Payoneer", "provider": "Manual request link + explicit send approval + owner payment verification", "configured": True, "requirements": []},
             {"id": "pricing", "name": "Client pricing", "provider": "Manual quotes · minimum $500 USD", "configured": True, "requirements": []},
             {"id": "conversation", "name": "Routine conversations", "provider": "Local rule-based assistant · no AI subscription", "configured": True, "requirements": []},
-            {"id": "model", "name": "Content drafting", "provider": "Optional local Ollama model", "configured": bool(model), "requirements": [{"name": "Local model name", "present": bool(model)}]},
-            {"id": "outreach", "name": "Cold outreach", "provider": "Separate warmed domain via Instantly or Smartlead; optional paid services", "configured": False, "requirements": []},
+            {"id": "model", "name": "Individual email drafting", "provider": "Local Ollama model · no paid API", "configured": bool(model), "requirements": [{"name": "Local model name", "present": bool(model)}]},
+            {"id": "outreach", "name": "Personal Gmail outreach", "provider": "Up to 12 reviewed first emails daily · bounce auto-pause", "configured": growth.dashboard()["enabled"], "requirements": []},
         ]
     provider = os.environ.get("OUTREACH_PROVIDER", "instantly")
     definitions = [
@@ -273,13 +302,15 @@ def state():
         actions = [unpack(row) for row in db.execute("SELECT id,lead_id,kind,status,result,created_at FROM outbox WHERE status IN ('pending','blocked','uncertain') ORDER BY created_at DESC")]
         return {"leads": leads, "approvals": approvals, "documents": documents, "events": events, "stages": engine.STAGES,
                 "providers": provider_status(), "outbox": actions, "mode": workspace_mode(), "outreach_health": setting(db, "outreach_health", {}), "updated_at": now(),
-                "mailbox": mailbox.public_status(), "ollama_model": setting(db, "ollama_model", ""), "minimum_package": 50000}
+                "mailbox": mailbox.public_status(), "ollama_model": setting(db, "ollama_model", ""), "minimum_package": 50000, "growth": growth.dashboard()}
 
 
 @app.post("/api/leads", status_code=201)
 def create_lead(body: LeadCreate):
     with connect() as db:
-        lead = add_lead(db, body.model_dump())
+        record = body.model_dump()
+        record["details"]["outreach_candidate"] = not body.details.client_contact
+        lead = add_lead(db, record)
         if body.details.client_contact:
             lead["stage"] = 4
             save_lead(db, lead)
@@ -306,7 +337,7 @@ def payment_received(lead_id: str, body: PaymentConfirmation):
 @app.post("/api/leads/{lead_id}/questionnaire")
 def send_questionnaire(lead_id: str, body: QuestionnaireSend):
     if not body.client_expects_contact:
-        raise Blocked("Confirm that the client expects this questionnaire. Gmail is not a cold outreach sender.")
+        raise Blocked("Confirm that the client expects this questionnaire. Use Lead finder to prepare a first-contact email.")
     with engine.LOCK, connect() as db:
         lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
         if not lead:
@@ -388,6 +419,53 @@ def local_model(body: ModelSetting):
     return {"status": "saved"}
 
 
+@app.post("/api/growth/settings")
+def growth_settings(body: GrowthSettings):
+    with connect() as db:
+        set_setting(db, "target_market", body.market)
+        set_setting(db, "gmail_daily_limit", body.daily_limit)
+        set_setting(db, "free_lead_sources", [source.model_dump() for source in body.sources])
+        event(db, None, "Human", "growth.configured", "Target market, daily limit and public directory sources updated")
+    return growth.dashboard()
+
+
+@app.post("/api/growth/outreach")
+def outreach_toggle(body: OutreachToggle):
+    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") != "true":
+        raise Blocked("Use Start ZanDop Workspace.bat for personal Gmail outreach.")
+    with engine.LOCK:
+        if body.enabled:
+            if not mailbox.public_status()["verified"]:
+                raise Blocked("Connect and test your Gmail account in Local setup first.")
+            with connect() as db:
+                if not setting(db, "ollama_model", ""):
+                    raise Blocked("Choose an installed local Ollama model in Local setup first.")
+                if setting(db, "gmail_outreach_paused", False) and not body.reviewed_bounces:
+                    raise Blocked("Review the delivery failure or sending error before resuming outreach.")
+            mailbox.start_bounce_monitor()
+        with connect() as db:
+            set_setting(db, "gmail_outreach_enabled", body.enabled)
+            if body.enabled:
+                set_setting(db, "gmail_outreach_paused", False)
+            event(db, None, "Human", "gmail_outreach.enabled" if body.enabled else "gmail_outreach.disabled", "Personal Gmail prospecting control changed; daily limit, review and capacity checks remain enforced")
+    return growth.dashboard()
+
+
+@app.post("/api/growth/sites")
+def inspect_sites(body: SiteIntake):
+    return free_leads.inspect_sites(body.urls, body.service)
+
+
+@app.post("/api/leads/{lead_id}/outreach-draft")
+def prepare_outreach(lead_id: str):
+    return growth.prepare(lead_id)
+
+
+@app.post("/api/leads/{lead_id}/review-outreach")
+def review_outreach(lead_id: str, body: DraftReview):
+    return growth.review(lead_id, body.draft_hash)
+
+
 @app.post("/api/leads/import")
 def import_csv(body: ImportCSV):
     rows = list(csv.DictReader(io.StringIO(body.csv_text)))
@@ -408,7 +486,7 @@ def lead_detail(lead_id: str):
         lead = unpack(db.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
         if not lead:
             raise KeyError(lead_id)
-        return {"lead": lead, "messages": [dict(row) for row in db.execute("SELECT * FROM messages WHERE lead_id=? ORDER BY created_at", (lead_id,))], "events": [dict(row) for row in db.execute("SELECT * FROM events WHERE lead_id=? ORDER BY created_at DESC", (lead_id,))]}
+        return {"lead": lead, "outreach_hash": growth.draft_hash(lead["details"].get("outreach_draft", {})), "messages": [dict(row) for row in db.execute("SELECT * FROM messages WHERE lead_id=? ORDER BY created_at", (lead_id,))], "events": [dict(row) for row in db.execute("SELECT * FROM events WHERE lead_id=? ORDER BY created_at DESC", (lead_id,))]}
 
 
 @app.post("/api/leads/{lead_id}/advance")

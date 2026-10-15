@@ -87,6 +87,14 @@ def initialize():
           document_id TEXT PRIMARY KEY REFERENCES documents(id), sha256 TEXT NOT NULL,
           requires_approval INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS outreach_attempts (
+          id TEXT PRIMARY KEY, action_id TEXT NOT NULL, lead_id TEXT NOT NULL REFERENCES leads(id),
+          email TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS project_starts (
+          lead_id TEXT PRIMARY KEY REFERENCES leads(id), week_key TEXT NOT NULL,
+          quote_reference TEXT NOT NULL, amount INTEGER NOT NULL, created_at TEXT NOT NULL
+        );
         """)
         # Retain old approvals when a client-specific quote is revised.
         schema = db.execute("SELECT sql FROM sqlite_master WHERE name='approvals'").fetchone()[0]

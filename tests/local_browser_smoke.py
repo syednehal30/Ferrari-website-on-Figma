@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -88,7 +89,30 @@ def main():
                     page.wait_for_selector(".modal", state="detached")
                     state = page.request.get(address + "/api/state").json()
                     assert [a["status"] for a in state["approvals"]] == ["pending", "superseded"]
-                    for route in ("inbox", "local-setup"):
+                    page.goto(address + "/#growth")
+                    page.get_by_role("heading", name="Find your next two clients.").wait_for()
+                    page.locator('[name="market"]').fill("Independent furniture stores in Manchester")
+                    page.locator('[name="daily_limit"]').fill("8")
+                    page.get_by_role("button", name="Save targeting").click()
+                    page.wait_for_function("state.growth.daily_limit === 8")
+                    assert "Independent%20furniture" in page.get_by_role("link", name="Google Maps").get_attribute("href")
+                    page.get_by_role("button", name="Enable personal Gmail outreach").click()
+                    page.get_by_text("Connect and test your Gmail account in Local setup first.", exact=True).wait_for()
+                    prospect = page.request.post(address + "/api/leads", data={"name": "Browser Prospect", "email": "prospect@example.com", "service": "website"}).json()
+                    draft = {"subject": "Your mobile experience", "body": "The page is missing a mobile viewport declaration. Could we help improve how people find your services on a phone? ZanDop"}
+                    with sqlite3.connect(directory / "zandop.sqlite3") as db:
+                        db.execute("UPDATE leads SET stage=3,details=? WHERE id=?", (json.dumps({"outreach_candidate": True, "outreach_draft": draft, "research": {"flaw": "The page is missing a mobile viewport declaration."}}), prospect["id"]))
+                    page.reload(wait_until="networkidle")
+                    page.get_by_role("button", name="Review first email", exact=True).click()
+                    page.get_by_text(draft["body"], exact=True).wait_for()
+                    page.locator('.modal input[type="checkbox"]').check()
+                    page.get_by_role("button", name="Allow this first email").click()
+                    page.wait_for_selector(".modal", state="detached")
+                    detail = page.request.get(address + "/api/leads/" + prospect["id"]).json()
+                    assert detail["lead"]["details"]["outreach_review_hash"] == detail["outreach_hash"]
+                    assert not detail["messages"], "Review must not bypass paused automation"
+                    page.screenshot(path="/tmp/zandop-growth-desktop.png", full_page=True)
+                    for route in ("inbox", "local-setup", "growth", "integrations"):
                         page.goto(address + "/#" + route)
                         page.set_viewport_size({"width": 390, "height": 844})
                         assert not page.evaluate("document.documentElement.scrollWidth > innerWidth"), route
@@ -96,7 +120,7 @@ def main():
                     browser.close()
                 second = subprocess.run([sys.executable, "scripts/local_demo.py", "--serve", "--workspace", "--no-browser"], cwd=root, env=config, capture_output=True, text=True, timeout=10)
                 assert second.returncode == 0 and "already running" in second.stdout
-                print("PASS: authenticated local launch, Gmail activation gate, inbox, questionnaire queue, $500 quote + PDF, explicit approval, revision invalidation, paused sends, mobile screens, and single-instance protection.")
+                print("PASS: authenticated local launch, Gmail activation gate, inbox, questionnaire, $500 quote + PDF, approval, revision invalidation, paused sends, growth targeting, exact outreach review, mobile screens, and single-instance protection.")
             finally:
                 server.terminate()
                 server.wait(timeout=10)

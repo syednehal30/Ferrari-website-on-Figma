@@ -47,6 +47,9 @@ def receive(db, message, channel, lead=None):
         lead = add_lead(db, {"name": message["name"][:120], "email": message["email"], "service": service, "source": "manual", "details": {"client_contact": True, "channel": "gmail"}})
         lead["stage"] = 4
     d = lead["details"]
+    if lead["stage"] < 4:
+        lead["stage"] = 4
+        db.execute("UPDATE outbox SET status='cancelled',result='Client replied before first email was sent' WHERE lead_id=? AND kind='cold_email' AND status IN ('pending','blocked')", (lead["id"],))
     d.update({"client_contact": True, "channel": "gmail" if not demo else "demo", "last_message_id": message_id,
               "last_client_message_at": now(), "reply_due_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()})
     body = message["body"].strip()[:10000]
@@ -55,7 +58,7 @@ def receive(db, message, channel, lead=None):
     event(db, lead["id"], "CRM", "client.message_received", "New client email recorded")
     lower = body.lower()
     response = None
-    if any(word in lower for word in ["unsubscribe", "no thanks", "remove me", "stop emailing", "do not contact"]):
+    if any(word in lower for word in ["unsubscribe", "no thanks", "not interested", "remove me", "stop emailing", "do not contact"]):
         db.execute("INSERT OR IGNORE INTO suppressions VALUES(?,?,?)", (lead["email"], "Client asked to stop", now()))
         lead["status"] = "suppressed"
         d["conversation_status"] = "suppressed"
@@ -69,9 +72,14 @@ def receive(db, message, channel, lead=None):
             gate = db.execute("SELECT status FROM approvals WHERE lead_id=? AND kind='proposal' AND json_extract(payload,'$.reference')=? ORDER BY created_at DESC LIMIT 1", (lead["id"], reference)).fetchone()
             if gate and gate[0] == "executed":
                 d["quote_accepted"] = {"reference": reference, "at": now(), "message_id": message_id}
-                response = "Thank you. I've recorded your confirmation of the agreed scope. We'll move on to the project plan and keep you updated on progress."
-                d["conversation_status"] = "scope_confirmed"
-                engine.welcome(db, lead)
+                from .growth import reserve_start
+                if reserve_start(db, lead):
+                    response = "Thank you. I've recorded your confirmation of the agreed scope. We'll move on to the project plan and keep you updated on progress."
+                    d["conversation_status"] = "scope_confirmed"
+                    engine.welcome(db, lead)
+                else:
+                    response = "Thank you. I've recorded your confirmation. Our current project slots are full, so we'll confirm the next available start with you before work begins."
+                    d["conversation_status"] = "awaiting_capacity"
                 event(db, lead["id"], "Sales", "quote.accepted", reference)
             else:
                 response = "Thank you. The agency owner still needs to complete the review. We'll follow up once that decision is recorded."

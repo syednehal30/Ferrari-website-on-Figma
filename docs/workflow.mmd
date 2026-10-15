@@ -12,8 +12,8 @@ flowchart LR
     I --> J[10 Reporting Agent]
     J --> K[11 Referral Agent]
   end
-  Booking[Signed booking event] -. Immediate welcome PDF .-> F
-  Notes[Call notes / transcript] -. Personalized project plan .-> F
+  Booking[Confirmed call or accepted scope] -. Immediate welcome PDF .-> F
+  Notes[Questionnaire answers / call notes] -. Personalized project plan .-> F
   G -.-> Store[Shopify / WooCommerce]
   G -.-> Web[WordPress / React / React Native]
   G -.-> Writer[Brand voice + SEO writer]
@@ -21,4 +21,8 @@ flowchart LR
   Human -. Final deliverables .-> H
   Human -. Exact invoice amount .-> I
   Audit[(Timestamped CRM + action queue)] -. All stages .-> E
-  K -. 30 days after close .-> Referral[Unique referral tracking link]
+  K -. 30 days after close .-> Referral[Unique referral code / mailto link]
+
+  Target[8–12 prospects daily / 2 weekly starts] -. Capacity policy .-> A
+  Gmail[Personal Gmail + local Ollama] -. Reviewed first email / daily cap .-> C
+  Payoneer[Owner-created Payoneer request] -. Approved send / verified receipt .-> I

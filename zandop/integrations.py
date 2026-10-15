@@ -68,6 +68,9 @@ def api(method, url, **kwargs):
 
 def send_cold(lead, payload, key):
     require_live()
+    if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
+        from .mailbox import send
+        return send(lead, payload, key, outreach=True)
     campaign = required("OUTREACH_CAMPAIGN_ID")
     provider = os.environ.get("OUTREACH_PROVIDER", "instantly")
     variables = {"company_name": lead["name"], "email_body": payload["body"], "email_subject": payload["subject"]}
@@ -162,18 +165,7 @@ def discover_places(query):
 def generate_json(system, prompt):
     require_live()
     if os.environ.get("ZANDOP_LOCAL_WORKSPACE") == "true":
-        from .db import connect, setting
-        with connect() as db:
-            model = setting(db, "ollama_model", "")
-        if not model:
-            raise Blocked("For content drafting, install Ollama locally, download a model, and enter its name in Local setup. No paid AI API is required.")
-        try:
-            response = httpx.post("http://127.0.0.1:11434/api/chat", timeout=120, trust_env=False,
-                json={"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], "format": "json", "stream": False})
-            response.raise_for_status()
-            return json.loads(response.json()["message"]["content"])
-        except (httpx.HTTPError, KeyError, ValueError):
-            raise Blocked("The local Ollama model could not produce a valid draft. Check that Ollama and your selected model are running.") from None
+        return generate_local_json(system, prompt)
     base = required("MODEL_BASE_URL").rstrip("/")
     if not base.startswith("https://"):
         raise Blocked("The model gateway must use HTTPS.")
@@ -183,6 +175,24 @@ def generate_json(system, prompt):
         return json.loads(result["choices"][0]["message"]["content"])
     except (KeyError, IndexError, json.JSONDecodeError):
         raise Blocked("Model response did not match the JSON contract.")
+
+
+def generate_local_json(system, prompt):
+    from .db import connect, setting
+    with connect() as db:
+        model = setting(db, "ollama_model", "")
+    if not model:
+        raise Blocked("Install Ollama, download a local model, and enter its name in Local setup. No paid AI API is required.")
+    try:
+        response = httpx.post("http://127.0.0.1:11434/api/chat", timeout=120, trust_env=False,
+            json={"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}], "format": "json", "stream": False})
+        response.raise_for_status()
+        result = json.loads(response.json()["message"]["content"])
+        if not isinstance(result, dict):
+            raise ValueError()
+        return result
+    except (httpx.HTTPError, KeyError, ValueError):
+        raise Blocked("The local Ollama model could not produce a valid draft. Check that Ollama and your selected model are running.") from None
 
 
 def verify_signature(body, signature, secret, timestamped=False):

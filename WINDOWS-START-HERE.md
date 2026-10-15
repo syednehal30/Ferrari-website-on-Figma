@@ -18,7 +18,21 @@ No hosting account, Docker, Stripe account or paid AI subscription is needed. Th
 5. Click **Save Gmail settings**, then **Test connection**. This checks IMAP/SMTP login without sending an email. It establishes a starting point; existing old mail is not automatically answered.
 6. Click **Enable automatic replies**. New client messages arriving in the label are checked every 60 seconds. Watch **Client inbox** for conversations, delivery issues and owner decisions.
 
-Use a dedicated agency Gmail inbox if possible. This connection handles expected client correspondence. Cold outreach still requires your separate warmed domain and Instantly/Smartlead setup; those optional services may cost money.
+Your **personal Gmail** handles both reviewed first emails and client conversations. No Instantly, Smartlead or extra domain is needed. Replies from prospects contacted through ZanDop are also read from INBOX automatically. Other personal email bodies are not imported.
+
+## Start personal outreach
+
+1. Install [Ollama for Windows](https://ollama.com/download/windows). In Terminal run `ollama pull qwen2.5:7b` (or choose a suitable installed model for your PC). Keep Ollama running. The model is free to download; it requires several GB of disk space and enough memory.
+2. In **Local setup**, save the installed model name, for example `qwen2.5:7b`.
+3. Open **Lead finder**. Choose a business niche and location. Set your daily first-email limit, normally 8–10 and never above 12.
+4. Use the Google Search/Maps links to identify suitable businesses. Paste up to twelve website URLs into **Inspect public websites**. The app finds published contacts; missing contacts require manual review. CSV imports and optional public directory feeds also work.
+5. With automation and a local model enabled, the agent prepares one prospect per cycle. You can also click **Research & draft** for a prospect. Check the business contact, the concrete observation and the individual email. Click **Allow this first email** when it is ready.
+6. Click **Enable personal Gmail outreach**. With automatic replies also enabled, the next cycle sends reviewed emails within the daily limit. No financial content is allowed in these first emails.
+7. A permanent bounce or uncertain send pauses new outreach. Check Gmail and resolve uncertain sends in **Client inbox** before resuming. Opted-out or bounced recipients remain suppressed.
+
+Aim for **8–12 qualified prospects per day and two new projects per week**, each starting at **$500 USD**. Accepted quotes reserve project slots; new outreach waits when two weekly starts or two active projects are filled. These limits do not guarantee sales. Existing client replies continue while new outreach is disabled.
+
+Free discovery depends on your selected sites and public feeds. ZanDop does not scrape Google results, bypass directory login pages, or invent business contacts.
 
 ## Run a project
 
